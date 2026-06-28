@@ -9,9 +9,7 @@ set -euo pipefail
 VARIANT="${VARIANT:-base}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 BENCH_IMAGE="${BENCH_IMAGE:-tcclaviger/vllm-rocm-mxfp4-nvfp4:latest}"
-R1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-render); C1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-card)
-R2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-render); C2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-card)
-for d in "$R1" "$C1" "$R2" "$C2" /dev/kfd; do [ -e "$d" ] || { echo "missing $d" >&2; exit 1; }; done
+for d in /dev/kfd /dev/dri; do [ -e "$d" ] || { echo "missing $d" >&2; exit 1; }; done
 
 if [ "$VARIANT" = "distill" ]; then
   MODEL="Capicua25x/Qwen3.6-35B-A3B-DSV4Pro-Thinking-Distill-MXFP4-Vision"
@@ -23,7 +21,7 @@ fi
 
 docker rm -f vllm-bench >/dev/null 2>&1 || true
 exec docker run -d --rm --name vllm-bench --network=host \
-  --device=/dev/kfd --device="$R1" --device="$C1" --device="$R2" --device="$C2" \
+  --device=/dev/kfd --device=/dev/dri \
   --group-add=video --group-add=render --ipc=host --security-opt seccomp=unconfined \
   -e HF_HUB_OFFLINE=1 \
   -v "$HF_CACHE":/root/.cache/huggingface \

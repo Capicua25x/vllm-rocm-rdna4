@@ -14,9 +14,7 @@ PATCHED="${PATCHED_TRITON:-gemma-nvfp4/port-0191/qwen_triton_unified_attention.3
 TARGET=/app/vllm/vllm/v1/attention/ops/triton_unified_attention.py
 [ -f "$PATCHED" ] || { echo "patched triton not found: $PATCHED" >&2; exit 1; }
 
-R1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-render); C1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-card)
-R2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-render); C2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-card)
-for d in "$R1" "$C1" "$R2" "$C2" /dev/kfd; do [ -e "$d" ] || { echo "missing $d" >&2; exit 1; }; done
+for d in /dev/kfd /dev/dri; do [ -e "$d" ] || { echo "missing $d" >&2; exit 1; }; done
 
 THREEDENV=()
 [ -n "${VLLM_TRITON_3D_SMALL_QLEN:-}" ] && THREEDENV=(-e "VLLM_TRITON_3D_SMALL_QLEN=${VLLM_TRITON_3D_SMALL_QLEN}")
@@ -27,7 +25,7 @@ EAGER=()
 
 docker rm -f vllm-qwen-test >/dev/null 2>&1 || true
 exec docker run -d --name vllm-qwen-test --network=host \
-  --device=/dev/kfd --device="$R1" --device="$C1" --device="$R2" --device="$C2" \
+  --device=/dev/kfd --device=/dev/dri \
   --group-add=video --group-add=render --ipc=host --security-opt seccomp=unconfined \
   -e HF_HUB_OFFLINE=1 \
   "${THREEDENV[@]}" \

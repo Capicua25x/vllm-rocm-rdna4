@@ -53,10 +53,6 @@ for f in "${FILES[@]}"; do
   MOUNTS+=( -v "$P/$f":"/build/vllm/vllm/$f":ro )
 done
 
-R1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-render); C1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-card)
-R2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-render); C2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-card)
-for dev in "$R1" "$C1" "$R2" "$C2" /dev/kfd; do [ -e "$dev" ] || { echo "missing $dev" >&2; exit 1; }; done
-
 # --enforce-eager toggle: ENFORCE_EAGER=1 (default) for bring-up; =0 for compiled+cudagraph.
 EAGER=()
 [ "${ENFORCE_EAGER:-1}" = "1" ] && EAGER=(--enforce-eager)
@@ -147,7 +143,7 @@ fi
 # Bring-up: NO --rm so a crashed container persists for `docker logs`. Clean up any prior run first.
 docker rm -f vllm-gemma >/dev/null 2>&1 || true
 exec docker run -d --name vllm-gemma --network=host \
-  --device=/dev/kfd --device="$R1" --device="$C1" --device="$R2" --device="$C2" \
+  --device=/dev/kfd --device=/dev/dri \
   --group-add=video --group-add=render --ipc=host \
   --security-opt=no-new-privileges --cap-drop=ALL --cap-add=DAC_READ_SEARCH --cap-add=IPC_LOCK --ulimit memlock=-1 \
   -e HF_HUB_OFFLINE=1 \

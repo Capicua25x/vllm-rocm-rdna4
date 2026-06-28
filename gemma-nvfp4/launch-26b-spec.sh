@@ -4,10 +4,8 @@
 # max-model-len lowered to 16384 to leave VRAM for the draft model + its KV.
 set -euo pipefail
 D="$(cd "$(dirname "$0")" && pwd)"
-R1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-render); C1=$(readlink -f /dev/dri/by-path/pci-0000:03:00.0-card)
-R2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-render); C2=$(readlink -f /dev/dri/by-path/pci-0000:06:00.0-card)
 exec docker run --rm --name vllm-gemma26-spec --network=host \
-  --device=/dev/kfd --device="$R1" --device="$C1" --device="$R2" --device="$C2" \
+  --device=/dev/kfd --device=/dev/dri \
   --group-add=video --group-add=render --ipc=host \
   --security-opt=no-new-privileges --cap-drop=ALL --cap-add=DAC_READ_SEARCH --cap-add=IPC_LOCK --ulimit memlock=-1 \
   -e HF_HUB_OFFLINE=1 \
