@@ -1,0 +1,6 @@
+# raw downstream regression output (withheld under NDA) — only regression_summary.txt is committed
+results/*/regression.log
+# battery progress logs (contain absolute host paths)
+results/*_battery.out
+# stray/superseded captures
+results/*/*.nomtp.json

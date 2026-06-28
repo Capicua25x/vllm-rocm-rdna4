@@ -1,0 +1,33 @@
+--- rdna_nvfp4_moe.orig.py	2026-06-22 11:55:56.929550351 -0400
++++ rdna_nvfp4_moe.patched.py	2026-06-22 11:56:44.756897559 -0400
+@@ -140,6 +140,8 @@
+             RoutingMethodType.Renormalize,
+             RoutingMethodType.RenormalizeNaive,
+             RoutingMethodType.Unspecified,
++            # Gemma-4: full-softmax -> top-k -> renormalize, computed in apply().
++            RoutingMethodType.Custom,
+         )
+ 
+     @staticmethod
+@@ -208,7 +210,20 @@
+         # routed_scaling_factor IS supported — applied to topk_weights below.
+ 
+         renormalize = True  # enforced by _supports_routing_method
+-        if e_score_correction_bias is not None:
++        routing_method_type = getattr(self.moe_config, "routing_method_type", None)
++        if routing_method_type == RoutingMethodType.Custom:
++            # Gemma-4 routing: softmax over ALL experts -> top-k -> renormalize.
++            # fused_topk scopes softmax differently, so replicate
++            # gemma4.Gemma4MoE.routing_function here (the model supplies it as a
++            # custom_routing_function that the fused RDNA path otherwise bypasses).
++            # Same (topk_weights, topk_ids) contract as fused_topk below.
++            probs = torch.softmax(router_logits.float(), dim=-1)
++            topk_weights, topk_ids = torch.topk(probs, self.topk, dim=-1)
++            topk_weights = (
++                topk_weights / topk_weights.sum(dim=-1, keepdim=True)
++            ).to(hidden_states.dtype)
++            topk_ids = topk_ids.to(torch.int32)
++        elif e_score_correction_bias is not None:
+             # sigmoid/softmax + bias + ungrouped top-k (MiniMax-M2 pattern).
+             # moe_config.scoring_func tells us which score function to apply
+             # before adding the bias; the canonical implementation lives in

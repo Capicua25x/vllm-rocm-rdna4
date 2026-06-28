@@ -1,0 +1,426 @@
+diff --git a/vllm/model_executor/layers/fused_moe/gpt_oss_triton_kernels_moe.py b/vllm/model_executor/layers/fused_moe/gpt_oss_triton_kernels_moe.py
+index e03ecd0..2cc340b 100644
+--- a/vllm/model_executor/layers/fused_moe/gpt_oss_triton_kernels_moe.py
++++ b/vllm/model_executor/layers/fused_moe/gpt_oss_triton_kernels_moe.py
+@@ -355,47 +355,96 @@ def triton_kernel_fused_experts(
+     )
+     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
+ 
+-    act = (
+-        FusedActivation(
+-            FnSpecs(
+-                "swiglu",
+-                triton_kernels.swiglu.swiglu_fn,
+-                ("alpha", "limit"),
+-                reduction_n=2,
+-            ),
+-            (swiglu_alpha, swiglu_limit),
+-        )
+-        if not use_legacy_triton_kernels
+-        else FusedActivation(
+-            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
+-            (swiglu_alpha, swiglu_limit),
+-            2,
+-        )
+-    )
+     gammas = routing_data.gate_scal if routing_data else None
+ 
+-    matmul_ogs(
+-        hidden_states,
+-        w1,
+-        quant_config.w1_bias,
+-        routing_data,
+-        gather_indx=gather_indx,
+-        precision_config=quant_config.w1_precision,
+-        gammas=gammas if apply_router_weight_on_input else None,
+-        fused_activation=act,
+-        y=intermediate_cache,
++    # RDNA4 (gfx12xx): triton_kernels' fused swiglu computes s*(linear+1) with
++    # alpha, but Qwen-style MoE needs silu(gate)*up. Unfuse the activation and
++    # use vLLM's silu_and_mul between GEMM1 and GEMM2 (mirrors Rob's working
++    # 0.18.1 monolithic path). The gather/scatter stay INSIDE the masked
++    # matmul_ogs kernels -> no raw torch fancy-index gather -> no OOB on ragged
++    # routing (the bug that plagued the modular UnfusedOAITritonExperts path).
++    _is_rdna4 = (
++        current_platform.is_rocm()
++        and triton.runtime.driver.active.get_current_target().arch.startswith("gfx12")
+     )
+ 
+-    matmul_ogs(
+-        intermediate_cache.view(M * topk, N // 2),
+-        w2,
+-        quant_config.w2_bias,
+-        routing_data,
+-        scatter_indx=scatter_indx,
+-        precision_config=quant_config.w2_precision,
+-        gammas=None if apply_router_weight_on_input else gammas,
+-        y=output_tensor,
+-    )
++    if _is_rdna4:
++        # GEMM1 -- full-N output, no fused activation.
++        gemm1_out = torch.empty(
++            (batch_dim, M * topk, N),
++            device=hidden_states.device,
++            dtype=hidden_states.dtype,
++        )
++        matmul_ogs(
++            hidden_states,
++            w1,
++            quant_config.w1_bias,
++            routing_data,
++            gather_indx=gather_indx,
++            precision_config=quant_config.w1_precision,
++            gammas=gammas if apply_router_weight_on_input else None,
++            fused_activation=None,
++            y=gemm1_out,
++        )
++
++        # silu(gate) * up
++        torch.ops._C.silu_and_mul(
++            intermediate_cache.view(M * topk, N // 2),
++            gemm1_out.view(M * topk, N),
++        )
++
++        # GEMM2 -- down projection.
++        matmul_ogs(
++            intermediate_cache.view(M * topk, N // 2),
++            w2,
++            quant_config.w2_bias,
++            routing_data,
++            scatter_indx=scatter_indx,
++            precision_config=quant_config.w2_precision,
++            gammas=None if apply_router_weight_on_input else gammas,
++            y=output_tensor,
++        )
++    else:
++        act = (
++            FusedActivation(
++                FnSpecs(
++                    "swiglu",
++                    triton_kernels.swiglu.swiglu_fn,
++                    ("alpha", "limit"),
++                    reduction_n=2,
++                ),
++                (swiglu_alpha, swiglu_limit),
++            )
++            if not use_legacy_triton_kernels
++            else FusedActivation(
++                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
++                (swiglu_alpha, swiglu_limit),
++                2,
++            )
++        )
++
++        matmul_ogs(
++            hidden_states,
++            w1,
++            quant_config.w1_bias,
++            routing_data,
++            gather_indx=gather_indx,
++            precision_config=quant_config.w1_precision,
++            gammas=gammas if apply_router_weight_on_input else None,
++            fused_activation=act,
++            y=intermediate_cache,
++        )
++
++        matmul_ogs(
++            intermediate_cache.view(M * topk, N // 2),
++            w2,
++            quant_config.w2_bias,
++            routing_data,
++            scatter_indx=scatter_indx,
++            precision_config=quant_config.w2_precision,
++            gammas=None if apply_router_weight_on_input else gammas,
++            y=output_tensor,
++        )
+     output_tensor = output_tensor.view(M, K)
+     return output_tensor
+ 
+@@ -556,6 +605,13 @@ class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
+         p = current_platform
+         if not p.is_cuda_alike():
+             return False
++        # RDNA4 (gfx12xx): MXFP4 MoE runs via the manual Triton dequant path
++        # (RDNAMXValueLayout -> mxfp4_dequant_rdna). It is NOT in the SM-style
++        # (9,0)<=cap<(11,0) window below, so allow it explicitly.
++        if p.is_rocm():
++            from vllm.platforms.rocm import on_gfx1x
++            if on_gfx1x():
++                return True
+         cap = p.get_device_capability()
+         if cap is None:
+             return False
+@@ -888,6 +944,13 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
+         p = current_platform
+         if not p.is_cuda_alike():
+             return False
++        # RDNA4 (gfx12xx): MXFP4 MoE runs via the manual Triton dequant path
++        # (RDNAMXValueLayout -> mxfp4_dequant_rdna). It is NOT in the SM-style
++        # (9,0)<=cap<(11,0) window below, so allow it explicitly.
++        if p.is_rocm():
++            from vllm.platforms.rocm import on_gfx1x
++            if on_gfx1x():
++                return True
+         cap = p.get_device_capability()
+         if cap is None:
+             return False
+@@ -911,7 +974,20 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
+ 
+     @staticmethod
+     def _supports_activation(activation: MoEActivation) -> bool:
+-        return activation == MoEActivation.SWIGLUOAI
++        if activation == MoEActivation.SWIGLUOAI:
++            return True
++        # RDNA4 (gfx12xx): triton_kernel_fused_experts unfuses the activation
++        # (silu_and_mul) on this device, so SiLU MoEs (e.g. Qwen) run correctly
++        # through this monolithic path -- which keeps gather/scatter inside the
++        # masked matmul_ogs (no raw torch gather OOB). Mirrors Rob's 0.18.1
++        # TRITON monolithic selection. Without this, the oracle falls back to
++        # UnfusedOAITritonExperts whose raw torch gather OOBs on ragged routing.
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1x
++
++            if on_gfx1x() and activation == MoEActivation.SILU:
++                return True
++        return False
+ 
+     @staticmethod
+     def _supports_parallel_config(
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+index 1b8b726..2aa66fd 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py
+@@ -153,6 +153,13 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
+         format = scheme_dict.get("format")
+ 
+         if quant_config._is_mxfp4(weight_quant):
++            # RDNA4 (gfx12xx) has no Marlin kernel (gptq_marlin_repack is
++            # CUDA-only). Route to a Triton-backed method instead of the
++            # Marlin-hardcoded CompressedTensorsW4A4Mxfp4MoEMethod.
++            if current_platform.is_rocm():
++                from vllm.platforms.rocm import on_gfx1x
++                if on_gfx1x():
++                    return CompressedTensorsMxfp4RdnaMoeMethod(layer.moe_config)
+             return CompressedTensorsW4A4Mxfp4MoEMethod(layer.moe_config)
+ 
+         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
+@@ -2539,3 +2546,139 @@ class CompressedTensorsW4A8Fp8MoEMethod(CompressedTensorsMoEMethod):
+     @property
+     def supports_eplb(self) -> bool:
+         return False
++
++
++class CompressedTensorsMxfp4RdnaMoeMethod(FusedMoEMethodBase):
++    """
++    MoE method for MXFP4A16 compressed-tensors format on RDNA4.
++
++    Delegates to Mxfp4MoEMethod (Triton backend) to avoid Marlin
++    (CUDA-only). Creates weights with _packed naming to match
++    compressed-tensors checkpoint format, then renames before
++    delegating to the inner Triton-based method.
++    """
++
++    def __init__(self, moe: FusedMoEConfig):
++        from vllm.model_executor.layers.quantization.mxfp4 import (
++            Mxfp4MoEMethod,
++        )
++        super().__init__(moe)
++        self._inner = Mxfp4MoEMethod(moe)
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        num_experts: int,
++        hidden_size: int,
++        intermediate_size_per_partition: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ):
++        # Use _packed names to match compressed-tensors checkpoint format
++        # (gate_up_proj_packed, down_proj_packed)
++        group_size = 32
++        layer.num_experts = num_experts
++        layer.params_dtype = params_dtype
++
++        # Set attributes that Mxfp4MoEMethod.process_weights_after_loading
++        # (TRITON path) expects from create_weights
++        self._inner.num_experts = num_experts
++        self._inner.intermediate_size = intermediate_size_per_partition
++        self._inner.hidden_size = hidden_size
++        self._inner.hidden_pad = 0
++        self._inner.intermediate_pad = 0
++
++        w13_weight = torch.nn.Parameter(
++            torch.empty(num_experts, 2 * intermediate_size_per_partition,
++                        hidden_size // 2, dtype=torch.uint8),
++            requires_grad=False)
++        layer.register_parameter("w13_weight_packed", w13_weight)
++        set_weight_attrs(w13_weight, extra_weight_attrs)
++
++        w2_weight = torch.nn.Parameter(
++            torch.empty(num_experts, hidden_size,
++                        intermediate_size_per_partition // 2,
++                        dtype=torch.uint8),
++            requires_grad=False)
++        layer.register_parameter("w2_weight_packed", w2_weight)
++        set_weight_attrs(w2_weight, extra_weight_attrs)
++
++        w13_weight_scale = torch.nn.Parameter(
++            torch.empty(num_experts, 2 * intermediate_size_per_partition,
++                        hidden_size // group_size, dtype=torch.uint8),
++            requires_grad=False)
++        layer.register_parameter("w13_weight_scale", w13_weight_scale)
++        scale_attrs = extra_weight_attrs.copy()
++        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.GROUP.value
++        set_weight_attrs(w13_weight_scale, scale_attrs)
++
++        w2_weight_scale = torch.nn.Parameter(
++            torch.empty(num_experts, hidden_size,
++                        intermediate_size_per_partition // group_size,
++                        dtype=torch.uint8),
++            requires_grad=False)
++        layer.register_parameter("w2_weight_scale", w2_weight_scale)
++        set_weight_attrs(w2_weight_scale, scale_attrs)
++
++        # Bias params needed by Mxfp4MoEMethod TRITON path
++        w13_bias = torch.nn.Parameter(
++            torch.zeros(num_experts, 2 * intermediate_size_per_partition,
++                        dtype=torch.bfloat16),
++            requires_grad=False)
++        layer.register_parameter("w13_bias", w13_bias)
++        set_weight_attrs(w13_bias, extra_weight_attrs)
++
++        w2_bias = torch.nn.Parameter(
++            torch.zeros(num_experts, hidden_size, dtype=torch.bfloat16),
++            requires_grad=False)
++        layer.register_parameter("w2_bias", w2_bias)
++        set_weight_attrs(w2_bias, extra_weight_attrs)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # Rename _packed -> unpacked (what Mxfp4MoEMethod expects)
++        if hasattr(layer, "w13_weight_packed"):
++            layer.w13_weight = torch.nn.Parameter(
++                layer.w13_weight_packed.data, requires_grad=False)
++            delattr(layer, "w13_weight_packed")
++
++        if hasattr(layer, "w2_weight_packed"):
++            layer.w2_weight = torch.nn.Parameter(
++                layer.w2_weight_packed.data, requires_grad=False)
++            delattr(layer, "w2_weight_packed")
++
++        # Delegate to Mxfp4MoEMethod (uses Triton backend, skips Marlin)
++        self._inner.process_weights_after_loading(layer)
++
++        # TRITON path doesn't set moe_quant_config during
++        # process_weights_after_loading — set it now so
++        # apply_monolithic can pass it to triton_kernel_moe_forward
++        self._inner.moe_quant_config = (
++            self._inner.get_fused_moe_quant_config(layer))
++
++    def get_fused_moe_quant_config(
++        self, layer: torch.nn.Module,
++    ) -> FusedMoEQuantConfig | None:
++        return self._inner.get_fused_moe_quant_config(layer)
++
++    @property
++    def is_monolithic(self) -> bool:
++        return self._inner.is_monolithic
++
++    def apply(
++        self,
++        layer: FusedMoE,
++        x: torch.Tensor,
++        topk_weights: torch.Tensor,
++        topk_ids: torch.Tensor,
++        shared_experts_input: torch.Tensor | None,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        return self._inner.apply(
++            layer, x, topk_weights, topk_ids, shared_experts_input)
++
++    def apply_monolithic(
++        self,
++        layer: FusedMoE,
++        x: torch.Tensor,
++        router_logits: torch.Tensor,
++    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
++        return self._inner.apply_monolithic(layer, x, router_logits)
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py
+index 77cea0f..94f8ce3 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_mxfp4.py
+@@ -81,7 +81,41 @@ class CompressedTensorsW4A16Mxfp4(CompressedTensorsScheme):
+         )
+         layer.register_parameter("weight_scale", weight_scale)
+ 
++    _FP4_E2M1_LUT = torch.tensor([
++        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
++        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
++    ], dtype=torch.float32)
++
++    @staticmethod
++    def _dequant_mxfp4_to_dtype(weight_packed, scale, dtype):
++        lo = (weight_packed & 0x0F).to(torch.int64)
++        hi = ((weight_packed >> 4) & 0x0F).to(torch.int64)
++        lut = CompressedTensorsW4A16Mxfp4._FP4_E2M1_LUT.to(
++            weight_packed.device)
++        w = torch.stack([lut[lo], lut[hi]], dim=-1).reshape(
++            weight_packed.shape[0], weight_packed.shape[1] * 2)
++        # E8M0 scale: 2^(scale_uint8 - 127)
++        scale_fp = (scale.to(torch.int32) - 127).float().exp2()
++        scale_fp = scale_fp.repeat_interleave(32, dim=-1)  # group_size=32
++        if scale_fp.shape[-1] > w.shape[-1]:
++            scale_fp = scale_fp[:, :w.shape[-1]]
++        return (w * scale_fp).to(dtype)
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        from vllm.platforms import current_platform
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1x
++            if on_gfx1x():
++                # RDNA4: dequant MXFP4 to model dtype at load time
++                self._rdna4_dequantized = True
++                params_dtype = getattr(layer, 'params_dtype', torch.bfloat16)
++                weight = self._dequant_mxfp4_to_dtype(
++                    layer.weight_packed.data, layer.weight_scale.data,
++                    params_dtype)
++                layer.weight = Parameter(weight, requires_grad=False)
++                del layer.weight_packed
++                return
++
+         # Rename weight_packed to weight that marlin expects
+         layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
+         del layer.weight_packed
+@@ -94,6 +128,9 @@ class CompressedTensorsW4A16Mxfp4(CompressedTensorsScheme):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if getattr(self, '_rdna4_dequantized', False):
++            return torch.nn.functional.linear(x, layer.weight, bias)
++
+         return apply_fp4_marlin_linear(
+             input=x,
+             weight=layer.weight,
+diff --git a/vllm/model_executor/layers/quantization/utils/mxfp4_utils.py b/vllm/model_executor/layers/quantization/utils/mxfp4_utils.py
+index 21c8aba..574b3f1 100644
+--- a/vllm/model_executor/layers/quantization/utils/mxfp4_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/mxfp4_utils.py
+@@ -44,10 +44,17 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
+         value_layout = StridedLayout
+         scale_layout = StridedLayout
+     elif current_platform.is_rocm():
+-        from vllm.platforms.rocm import on_gfx950
++        from vllm.platforms.rocm import on_gfx1x, on_gfx950
+ 
+         value_layout = StridedLayout
+-        if on_gfx950():
++        if on_gfx1x():
++            # RDNA4: RDNAMXValueLayout routes to the manual Triton dequant
++            # (mxfp4_dequant_rdna) in the matmul kernel; strided scales.
++            from triton_kernels.tensor_details.layout import RDNAMXValueLayout
++
++            value_layout = RDNAMXValueLayout
++            scale_layout = StridedLayout
++        elif on_gfx950():
+             try:
+                 # triton < 3.6
+                 from triton_kernels.tensor_details.layout import GFX950MXScaleLayout

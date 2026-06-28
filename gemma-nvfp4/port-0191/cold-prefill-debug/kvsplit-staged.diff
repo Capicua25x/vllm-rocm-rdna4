@@ -1,0 +1,400 @@
+diff --git a/tests/kernels/attention/test_triton_unified_attention.py b/tests/kernels/attention/test_triton_unified_attention.py
+index 99cdc7f..564eba8 100644
+--- a/tests/kernels/attention/test_triton_unified_attention.py
++++ b/tests/kernels/attention/test_triton_unified_attention.py
+@@ -221,6 +221,167 @@ def test_triton_unified_attn(
+     )
+ 
+ 
++# ── KV-split large-query (cold-prefill fix) parity gate ──────────────────────
++# The existing suite is GREEN-BLIND to the 3D split-KV kernel at query_len>1: it
++# is reached only by the all-(1, kv) decode cases above. The cold-prefill fix
++# routes LARGE-query prefill chunks (BLOCK_Q>1, multi-query-per-tile) through the
++# 3D kernel, which forces the never-validated per-row divergent active-segment
++# online-softmax merge in reduce_segments. This test closes that gap: it runs the
++# SAME inputs through the 2D kernel (reference) and the 3D kernel (seq_threshold_3D
++# sized to admit the whole prefill chunk) and asserts tight 2D-vs-3D parity — any
++# gap is a structural split/merge bug, since both are identical bf16+fp32 math.
++# head_size=512 is included on purpose: it is the Gemma-4 full-attention head and
++# proves the 3D path fits RDNA4's 64KiB LDS at TILE=32 (the layer the fix targets).
++LARGE_Q_SEQ_LENS = [
++    [(8, 2048)],  # single seq, multi-query, deep KV -> all 16 segments multi-tile
++    [(4, 1031), (4, 4099)],  # mixed depths, two seqs
++    [(16, 8192)],  # widest BLOCK_M packing x deepest KV
++    [(2, 600), (3, 257), (1, 19)],  # ragged; (3,257) flips a partially-masked tail seg
++]
++
++
++@pytest.mark.parametrize("seq_lens", LARGE_Q_SEQ_LENS)
++@pytest.mark.parametrize("num_heads", NUM_HEADS)  # (5,1) -> BLOCK_Q=3, worst packing
++@pytest.mark.parametrize("head_size", [128, 256, 512])
++@pytest.mark.parametrize("block_size", BLOCK_SIZES)
++# sliding_window smaller than the query span over deep KV forces a fully
++# SW-masked tail segment for early rows -> exercises the m_j=-inf / expsum==0 guards
++@pytest.mark.parametrize("sliding_window", [None, 64, 256])
++@pytest.mark.parametrize("soft_cap", [None, 50.0])
++@torch.inference_mode()
++def test_triton_unified_attn_3d_large_query(
++    seq_lens: list[tuple[int, int]],
++    num_heads: tuple[int, int],
++    head_size: int,
++    sliding_window: int | None,
++    block_size: int,
++    soft_cap: float | None,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    import vllm.v1.attention.ops.triton_unified_attention as tua
++
++    # _ALLOW_3D_SMALL_QLEN is read ONCE at import from the env, so setting the env
++    # var would silently no-op here; patch the module attribute directly. With it
++    # True, the 2D/3D gate becomes purely capacity-based (_use_2d = q.shape[0] >
++    # seq_threshold_3D), letting query_len>1 ride the 3D kernel.
++    monkeypatch.setattr(tua, "_ALLOW_3D_SMALL_QLEN", True)
++
++    # NOTE: this test intentionally does NOT exercise multimodal (mm_prefix) prefill.
++    # The 3D split-KV kernel has no USE_MM_PREFIX branch, so the dispatcher forces any
++    # use_mm_prefix chunk onto the 2D path (see the gate in triton_unified_attention.py).
++    # The 3D kernel is therefore unreachable with mm_prefix and there is nothing new to
++    # differentially verify there; the text-prefill cases below are the 3D coverage.
++    torch.set_default_device("cuda")
++    set_random_seed(0)
++
++    num_seqs = len(seq_lens)
++    query_lens = [x[0] for x in seq_lens]
++    kv_lens = [x[1] for x in seq_lens]
++    num_query_heads, num_kv_heads = num_heads
++    assert num_query_heads % num_kv_heads == 0
++    total_q = sum(query_lens)
++    max_query_len = max(query_lens)
++    max_kv_len = max(kv_lens)
++    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
++    scale = head_size**-0.5
++    dtype = torch.bfloat16
++    num_blocks = 32768
++
++    query = torch.randn(total_q, num_query_heads, head_size, dtype=dtype)
++    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
++    value_cache = torch.randn_like(key_cache)
++    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
++        dim=0, dtype=torch.int32
++    )
++    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
++    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
++    block_tables = torch.randint(
++        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
++    )
++
++    num_par_softmax_segments = 16
++    head_size_padded = next_power_of_2(head_size)
++
++    # Mirror prod exactly: seq_threshold_3D stays small (decode-sized), and the segm
++    # buffers are grown to admit the whole chunk. That makes the dispatch pick the 3D
++    # kernel (q.shape[0] <= buffer cap) AND the prefill tile (q.shape[0] > seq_threshold_3D
++    # -> TILE_SIZE_PREFILL, not TILE_SIZE_DECODE) — the genuine cold-prefill code path.
++    SMALL_THR = 4  # < every total_q below, so the prefill-tile branch is exercised
++    assert total_q > SMALL_THR
++
++    def run(seq_threshold_3D: int, cap: int) -> torch.Tensor:
++        segm_output = torch.empty(
++            (cap, num_query_heads, num_par_softmax_segments, head_size_padded),
++            dtype=torch.float32,
++        )
++        segm_max = torch.empty(
++            (cap, num_query_heads, num_par_softmax_segments), dtype=torch.float32
++        )
++        segm_expsum = torch.empty_like(segm_max)
++        # fp32 out so the 2D-vs-3D differential compares the raw fp32 accumulators.
++        # bf16 out would round both legs to ~7.8e-3 ULP near 1.0, well above the 2e-3
++        # parity tolerance, making the assert a coin flip (W4). The kernel stores its
++        # fp32 acc directly when out is fp32 (USE_FP8 is False here), so no precision
++        # is lost vs the production bf16 store — production correctness is still covered
++        # by the looser ref_paged_attn comparison below.
++        out = torch.empty(
++            (total_q, num_query_heads, head_size),
++            dtype=torch.float32,
++            device=query.device,
++        )
++        unified_attention(
++            q=query,
++            k=key_cache,
++            v=value_cache,
++            out=out,
++            cu_seqlens_q=cu_query_lens,
++            seqused_k=kv_lens_t,
++            max_seqlen_q=max_query_len,
++            max_seqlen_k=max_kv_len,
++            softmax_scale=scale,
++            causal=True,
++            window_size=window_size,
++            block_table=block_tables,
++            softcap=soft_cap if soft_cap is not None else 0,
++            q_descale=None,
++            k_descale=None,
++            v_descale=None,
++            seq_threshold_3D=seq_threshold_3D,
++            num_par_softmax_segments=num_par_softmax_segments,
++            softmax_segm_output=segm_output,
++            softmax_segm_max=segm_max,
++            softmax_segm_expsum=segm_expsum,
++        )
++        return out
++
++    # 2D leg: cap=1 so q.shape[0] > buffer cap -> _use_2d=True (the reference).
++    out_2d = run(seq_threshold_3D=0, cap=1)
++    # 3D leg: small threshold + buffers grown to total_q -> 3D kernel, prefill tile.
++    out_3d = run(seq_threshold_3D=SMALL_THR, cap=total_q)
++
++    ref_output = ref_paged_attn(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        kv_lens=kv_lens,
++        block_tables=block_tables,
++        scale=scale,
++        sliding_window=sliding_window,
++        soft_cap=soft_cap,
++    )
++
++    # Tight 2D-vs-3D differential: both legs accumulate in fp32 and we now store fp32,
++    # so any gap is a real split/merge bug, not bf16 rounding noise. ref_paged_attn
++    # (looser, bf16) catches gross errors; check_dtype=False since out is fp32 vs ref bf16.
++    torch.testing.assert_close(
++        out_3d, out_2d, atol=2e-3, rtol=2e-3,
++        msg=lambda m: f"2D-vs-3D parity broke: max|d|={torch.max(torch.abs(out_3d - out_2d))}\n{m}",
++    )
++    torch.testing.assert_close(out_3d, ref_output, atol=1.5e-2, rtol=1e-2, check_dtype=False)
++    torch.testing.assert_close(out_2d, ref_output, atol=1.5e-2, rtol=1e-2, check_dtype=False)
++
++
+ @pytest.mark.parametrize(
+     "seq_lens",
+     [
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 6d967b5..78795d1 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """High-Performance Triton-only Attention layer."""
+ 
++import os
+ from dataclasses import dataclass
+ from typing import ClassVar
+ 
+@@ -33,7 +34,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+     triton_reshape_and_cache_flash,
+ )
+ from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+-from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
+ 
+ logger = init_logger(__name__)
+ 
+@@ -42,6 +43,13 @@ logger = init_logger(__name__)
+ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
+ NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+ 
++# Cold-prefill fix (env-gated, default OFF). When set, grow the 3D split-KV segm
++# buffers on FULL-attention builders from seq_threshold_3D (~decode-sized) to
++# max_num_batched_tokens, so large-query prefill chunks ride the parallel 3D kernel
++# instead of the low-occupancy serial 2D kernel. Scoped to FullAttentionSpec so the
++# sliding-window builders (windowed, cheap) do not waste the extra memory.
++_ALLOW_3D_PREFILL = os.environ.get("VLLM_TRITON_3D_PREFILL", "0") == "1"
++
+ 
+ @dataclass
+ class TritonAttentionMetadata:
+@@ -168,9 +176,33 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+ 
+         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+         headdim_padded = next_power_of_2(self.headdim)
++
++        # Cold-prefill fix: the segm buffers are indexed by absolute query-token index,
++        # so their first dim is the max query-tokens that may ride the 3D kernel. Decode
++        # needs only seq_threshold_3D (~32); to admit large-query prefill chunks we grow
++        # it to max_num_batched_tokens — but ONLY on full-attention builders (the slow
++        # deep-KV layers), since sliding-window layers are windowed and cheap. Gating the
++        # dispatch on this buffer capacity (q.shape[0] > segm.shape[0]) keeps decode and
++        # spec-verify unchanged whenever the buffers stay seq_threshold_3D-sized.
++        #
++        # Memory: softmax_segm_output dominates at
++        #   cap * num_heads_q * NUM_PAR_SOFTMAX_SEGMENTS(16) * headdim_padded * 4 bytes.
++        # For the prod Gemma full-attn group at TP2 (cap=max_num_batched_tokens=2048,
++        # num_heads_q=8/rank, headdim_padded=512) that is ~512 MiB/rank — one shared
++        # full-attn builder, not x5 layers. It scales LINEARLY with max_num_batched_tokens,
++        # so a large --max-num-batched-tokens (e.g. 8192) is the only OOM risk; the prefill
++        # chunk size is itself bounded by that value, so the buffer is never over-sized.
++        segm_token_capacity = self.seq_threshold_3D
++        if _ALLOW_3D_PREFILL and isinstance(kv_cache_spec, FullAttentionSpec):
++            segm_token_capacity = max(
++                self.seq_threshold_3D,
++                vllm_config.scheduler_config.max_num_batched_tokens,
++            )
++        self.segm_token_capacity = segm_token_capacity
++
+         self.softmax_segm_output = torch.empty(
+             (
+-                self.seq_threshold_3D,
++                segm_token_capacity,
+                 self.num_heads_q,
+                 self.num_par_softmax_segments,
+                 headdim_padded,
+@@ -179,12 +211,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+             device=device,
+         )
+         self.softmax_segm_max = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (segm_token_capacity, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+         self.softmax_segm_expsum = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (segm_token_capacity, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index ca5d0e3..99a0d6c 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -7,6 +7,8 @@
+ #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
+ #  - Thomas Parnell <tpa@zurich.ibm.com>
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -18,6 +20,33 @@ logger = init_logger(__name__)
+ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+ float8_info = torch.finfo(current_platform.fp8_dtype())
+ 
++# Spec-decode 6K fix (experiment, 2026-06-25): the 3D split-KV (flash-decoding)
++# kernel is normally gated to pure decode (max_seqlen_q <= 1). The spec-decode
++# VERIFY forward processes >1 query token/seq (bonus + drafted), so it falls to
++# the 2D kernel, which at low batch + long context has a tiny launch grid and
++# near-zero KV-dimension parallelism -> the dominant cost of the 6K spec-decode
++# regression. The 3D kernel is written generically over q-blocks and its segm
++# buffers are indexed by absolute TOKEN index (capacity = seq_threshold_3D), so
++# it is safe + correct for small query_len as long as total query tokens fit the
++# buffer (q.shape[0] <= seq_threshold_3D). When VLLM_TRITON_3D_SMALL_QLEN=1, gate
++# the 2D fallback on actual token count instead of blanket-banning query_len>1.
++_ALLOW_3D_SMALL_QLEN = os.environ.get("VLLM_TRITON_3D_SMALL_QLEN", "0") == "1"
++
++# Cold-prefill fix (env-gated, default OFF). VLLM_TRITON_3D_PREFILL=1 grows the segm
++# buffers to max_num_batched_tokens (in the FullAttentionSpec builder) so large-query
++# prefill chunks fit and ride the 3D split-KV kernel. It must ALSO open the dispatch
++# gate below — read it here so VLLM_TRITON_3D_PREFILL=1 is self-sufficient and does NOT
++# additionally require VLLM_TRITON_3D_SMALL_QLEN=1 (which only sizes for spec-verify).
++_ALLOW_3D_PREFILL = os.environ.get("VLLM_TRITON_3D_PREFILL", "0") == "1"
++
++# Cold-prefill experiment (env-gated, default OFF = no behavior change). The 2D
++# attention kernel is 93% of cold long-context prefill time because each program
++# serially sweeps the whole KV with a small TILE_SIZE=32. VLLM_PREFILL_TILE_SIZE=128
++# (or 64/256) overrides ONLY the prefill KV tile to test whether fatter tiles
++# (better arithmetic intensity / fewer loop iters) flatten the super-quadratic
++# depth curve. Decode path is untouched. Read once at import.
++_PREFILL_TILE_OVERRIDE = int(os.environ.get("VLLM_PREFILL_TILE_SIZE", "0"))
++
+ 
+ @triton.jit
+ def cdiv_fn(x, y):
+@@ -871,6 +900,11 @@ def _get_tile_size(
+     the larger head dimension (128/256). For other models, use
+     the default vLLM behavior.
+     """
++    # Cold-prefill experiment (env-gated): override the prefill KV tile only.
++    # Decode path untouched. Default (unset/0) preserves all behavior below.
++    if is_prefill and _PREFILL_TILE_OVERRIDE > 0:
++        return _PREFILL_TILE_OVERRIDE
++
+     if _is_gemma3_attention(head_size, sliding_window):
+         # Gemma3: use 32 for decode (default is 16)
+         return 32
+@@ -976,14 +1010,41 @@ def unified_attention(
+     # 2. The batch includes at least one prefill request, or
+     # 3. The number of sequences exceeds the configured threshold, or
+     # 4. Batch invariance is enabled
++    # When _ALLOW_3D_SMALL_QLEN, allow the 3D split-KV kernel for query_len>1
++    # (e.g. spec-decode verify) as long as the total query tokens fit the segm
++    # buffers (q.shape[0] <= seq_threshold_3D). For pure decode q.shape[0]==num_seqs
++    # so this is identical to the original num_seqs guard; genuine prefills exceed
++    # the buffer capacity and correctly fall back to the 2D kernel.
++    if seq_threshold_3D is None:
++        _use_2d = True
++    elif _ALLOW_3D_SMALL_QLEN or _ALLOW_3D_PREFILL:
++        # Buffer-capacity-aware gate: ride the 3D split-KV kernel whenever the segm
++        # buffers can hold all query tokens. When the buffers are sized to
++        # seq_threshold_3D (default) this is identical to `q.shape[0] > seq_threshold_3D`
++        # (so decode + spec-verify behavior is unchanged). When the FullAttentionSpec
++        # builder grows them to max_num_batched_tokens (cold-prefill fix,
++        # VLLM_TRITON_3D_PREFILL=1), large-query prefill chunks now fit and ride the
++        # 3D kernel instead of the low-occupancy serial 2D kernel.
++        #
++        # use_mm_prefix forces the 2D path: the 3D kernel has NO USE_MM_PREFIX branch,
++        # so it would silently drop the bidirectional image/mm-prefix key range that the
++        # 2D kernel handles (triton_unified_attention 2D ~:217). Gemma-4 is multimodal,
++        # so routing an image-prefill chunk through 3D would miscompute attention. Keep
++        # multimodal prefill on the correct 2D path until the 3D kernel grows the branch.
++        _use_2d = (
++            use_mm_prefix
++            or softmax_segm_output is None
++            or q.shape[0] > softmax_segm_output.shape[0]
++        )
++    else:
++        _use_2d = max_seqlen_q > 1 or num_seqs > seq_threshold_3D
+     if (
+         seq_threshold_3D is None
+         or num_par_softmax_segments is None
+         or softmax_segm_output is None
+         or softmax_segm_max is None
+         or softmax_segm_expsum is None
+-        or max_seqlen_q > 1
+-        or num_seqs > seq_threshold_3D
++        or _use_2d
+         or is_batch_invariant
+     ):
+         kernel_unified_attention_2d[
+@@ -1042,6 +1103,21 @@ def unified_attention(
+             USE_FP8=output_scale is not None,
+         )
+     else:
++        # Genuine large-query prefill (only reachable when the segm buffers were grown
++        # past seq_threshold_3D) uses the prefill KV tile so the ONLY difference from the
++        # working 2D prefill is the added KV-segment parallelism — not the tile size.
++        # Decode and small spec-verify batches (q.shape[0] <= seq_threshold_3D) keep
++        # TILE_SIZE_DECODE. NOTE: under VLLM_TRITON_3D_PREFILL=1 the buffers are grown,
++        # so a *busy* spec-verify batch whose pooled query tokens exceed seq_threshold_3D
++        # also takes this branch (3D + TILE_SIZE_PREFILL). That is still correct (same
++        # split-KV/LSE-merge math, tile is consistent across kernel + reduce), but it is
++        # NOT byte-for-byte identical to the prefill-flag-off path — only the default
++        # (VLLM_TRITON_3D_SMALL_QLEN-only) 6K MTP spec-decode path is unchanged.
++        tile_size_3d = (
++            TILE_SIZE_PREFILL
++            if (max_seqlen_q > 1 and q.shape[0] > seq_threshold_3D)
++            else TILE_SIZE_DECODE
++        )
+         kernel_unified_attention_3d[
+             (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
+         ](
+@@ -1067,7 +1143,7 @@ def unified_attention(
+             query_stride_1=q.stride(1),
+             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+             BLOCK_SIZE=block_size,
+-            TILE_SIZE=TILE_SIZE_DECODE,
++            TILE_SIZE=tile_size_3d,
+             HEAD_SIZE=head_size,
+             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+             USE_ALIBI_SLOPES=use_alibi_slopes,
+@@ -1105,7 +1181,7 @@ def unified_attention(
+             output_stride_0=out.stride(0),
+             output_stride_1=out.stride(1),
+             block_table_stride=block_table.stride(0),
+-            TILE_SIZE=TILE_SIZE_DECODE,
++            TILE_SIZE=tile_size_3d,
+             HEAD_SIZE=head_size,
+             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+             query_start_len_ptr=cu_seqlens_q,

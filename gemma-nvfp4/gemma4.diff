@@ -1,0 +1,44 @@
+--- gemma4.orig.py	2026-06-22 15:48:43.209831652 -0400
++++ gemma4.patched.py	2026-06-22 16:30:55.881139156 -0400
+@@ -993,6 +993,41 @@
+                     loaded_params.add(remapped_name)
+                     continue
+ 
++            # Per-expert separate QUANTIZED MoE layout (NVFP4 compressed-tensors,
++            # e.g. RedHatAI gemma-4-26B-A4B-it-NVFP4):
++            #   experts.{E}.{gate,up,down}_proj.{weight_packed,weight_scale,
++            #     weight_global_scale,input_global_scale}
++            # -> FusedMoE params  moe.experts.w{13,2}_{suffix}  (shard w1/w3/w2,
++            # expert E). The stock gemma4 loader only wired the fused-3D *unquantized*
++            # layout, so these per-expert quantized scales fell through to direct
++            # load and KeyError'd.
++            _qm = re.search(
++                r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\."
++                r"(weight_packed|weight_scale|weight_global_scale|input_global_scale)$",
++                name,
++            )
++            if _qm is not None:
++                _shard = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}[
++                    _qm.group(2)
++                ]
++                _fam = "w13_" if _qm.group(2) in ("gate_proj", "up_proj") else "w2_"
++                _moe_name = (
++                    name[: _qm.start()] + ".moe.experts." + _fam + _qm.group(3)
++                )
++                if _moe_name in params_dict and not is_pp_missing_parameter(
++                    _moe_name, self
++                ):
++                    _param = params_dict[_moe_name]
++                    _param.weight_loader(
++                        _param,
++                        loaded_weight,
++                        _moe_name,
++                        shard_id=_shard,
++                        expert_id=int(_qm.group(1)),
++                    )
++                    loaded_params.add(_moe_name)
++                continue
++
+             for param_name, shard_name, shard_id in stacked_params_mapping:
+                 if shard_name not in name:
+                     continue

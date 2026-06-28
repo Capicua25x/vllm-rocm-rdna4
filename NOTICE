@@ -1,0 +1,39 @@
+vllm-rocm-rdna4
+Copyright 2026 Capicua25x
+
+This product is a derivative work of vLLM (https://github.com/vllm-project/vllm),
+licensed under the Apache License, Version 2.0. A copy of that license is in the
+LICENSE file in this repository.
+
+Modifications in this repository (see patches/ and gemma-nvfp4/) add AMD RDNA4
+(gfx1201) enablement to vLLM 0.19.1 and are released under the same Apache License,
+Version 2.0. Changes are delivered as patch files (diffs against the stated upstream
+versions) and grafted source files that preserve the upstream copyright and SPDX
+headers; the patches and this NOTICE are the record of what changed.
+
+This repository also includes:
+
+  * Code backported from vLLM 0.23.0 — the gemma4_assistant draft-model spec-decode
+    (a Gemma4MTPModel / Gemma4AssistantForCausalLM class plus framework patches).
+    Same upstream project, Apache-2.0; a newer revision than the 0.19.1 base.
+
+  * A clean-room Triton re-implementation of a head-dim-512 flash-attention chunking
+    technique whose blueprint comes from llama.cpp
+    (https://github.com/ggml-org/llama.cpp), MIT-licensed. No llama.cpp code was
+    copied — only the algorithm/tile-configuration was used as a reference.
+
+  * Forward-ported RDNA4 MXFP4 / NVFP4 kernel enablement derived from Rob Smith's
+    tcclaviger/vllm-rocm-mxfp4-nvfp4 RDNA4 work.
+
+Other components used or referenced (not modified, not redistributed here):
+
+  * Triton / triton_kernels — MIT.
+  * AMD ROCm (hipBLASLt, rocBLAS, RCCL, HIP) — MIT.
+  * PyTorch — BSD-3-Clause (inherited via the base image).
+  * HuggingFace Transformers — Apache-2.0 (inherited via the base image).
+
+This is a build recipe; no model weights are included. Model weights are bind-mounted
+at runtime from the user's own Hugging Face cache. Model families referenced
+(Qwen3.5/3.6-MoE by Alibaba; Gemma-4 by Google; the RedHatAI NVFP4 quantization of
+Gemma-4) are the property of their respective owners — confirm the license on the
+specific model card you deploy.
