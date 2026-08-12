@@ -33,6 +33,7 @@ R9700; a single 32 GB card fits the smaller quants at reduced context.
 |---|---|---|
 | **Qwen3.5/3.6-35B-A3B family** (incl. hybrid GDN + MTP head, e.g. [Ornith-1.0-35B](https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B)) | MXFP4 (native kernel) | ✅ production — 111 tok/s @7k ctx w/ MTP, 262k context |
 | **Muse Glimmer 30B** (multimodal) | FP8 | ✅ validated — serving, tool-calling (`muse_glimmer` parsers), agentic use; DFlash drafter integration in validation |
+| **Gemma 4 26B-A4B-it** | NVFP4 (native RDNA4 MoE patches) | ✅ validated — MTP assistant backport, 256k context; full recipe in [`gemma-nvfp4/`](../../tree/rdna4/gemma-nvfp4) |
 | **Qwen 3.8-27B** | FP8 planned | 🎯 targeted — image gates will extend the day weights ship |
 
 Anything upstream vLLM runs on ROCm also works here unchanged; the value of
