@@ -59,8 +59,34 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
         value_layout = StridedLayout
         scale_layout = StridedLayout
     elif current_platform.is_rocm():
+        from vllm.platforms.rocm import on_rdna4
+
         value_layout = StridedLayout
-        if should_use_cdna4_mx_scale_swizzle():
+        if on_rdna4():
+            # RDNA4 (gfx1200/gfx1201): sin MFMA y sin `tl.dot_scaled`. El
+            # injerto RDNA de triton_kernels trae un dequant MXFP4 dentro del
+            # kernel (`mxfp4_dequant_rdna`), y la ÚNICA forma de seleccionarlo
+            # desde matmul_ogs es etiquetar los valores con RDNAMXValueLayout:
+            # su `swizzle_data` es la identidad, lo único que hace es propagar
+            # name="RDNA_VALUE" como SWIZZLE_MX_VALUE. Las escalas siguen
+            # strided. Sin esto, gfx12 cae en la rama CDNA/strided y decodifica
+            # los pesos con las suposiciones equivocadas — EN SILENCIO.
+            # Gate `on_rdna4()`, no `on_gfx1x()` como en 0.19.1: gfx11 (RDNA3)
+            # no dispara la rama RDNA4 de `opt_flags` y este camino no se probó
+            # allí. Divergencia deliberada respecto al hunk #4 original.
+            try:
+                from triton_kernels.tensor_details.layout import RDNAMXValueLayout
+            except ImportError as e:
+                raise ImportError(
+                    "MXFP4 en gfx12xx requiere el injerto RDNA de "
+                    "triton_kernels (RDNAMXValueLayout). Sin él, el layout "
+                    "strided decodificaría los pesos mal en silencio, así que "
+                    "esto falla en vez de continuar."
+                ) from e
+
+            value_layout = RDNAMXValueLayout
+            scale_layout = StridedLayout
+        elif should_use_cdna4_mx_scale_swizzle():
             try:
                 # triton < 3.6
                 from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
