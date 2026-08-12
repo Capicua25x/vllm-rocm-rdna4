@@ -77,6 +77,9 @@ from vllm.model_executor.kernels.linear.mxfp4 import (
 from vllm.model_executor.kernels.linear.mxfp4.aiter import (
     AiterMxfp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp4.rdna import (
+    RdnaMxfp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp4.emulation import (
     EmulationMxfp4LinearKernel,
 )
@@ -533,6 +536,7 @@ _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     ],
     PlatformEnum.ROCM: [
         AiterMxfp4LinearKernel,
+        RdnaMxfp4LinearKernel,
         EmulationMxfp4LinearKernel,
     ],
     PlatformEnum.XPU: [
@@ -1129,6 +1133,7 @@ def register_linear_kernel(
 
 
 __all__ = [
+    "RdnaMxfp4LinearKernel",
     "init_fp8_linear_kernel",
     "init_int8_linear_kernel",
     "init_nvfp4_linear_kernel",
