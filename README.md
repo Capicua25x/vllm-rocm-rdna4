@@ -23,6 +23,30 @@ Note: spec-decode configs must pin the drafter's backend explicitly —
 `--speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'` —
 the drafter does not inherit `--attention-backend` (upstream design).
 
+
+## Models currently targeted (validated on this stack)
+
+Hardware envelope for everything below: **2× 32 GB (64 GB total), TP2** — dual
+R9700; a single 32 GB card fits the smaller quants at reduced context.
+
+| model | quant | status |
+|---|---|---|
+| **Qwen3.5/3.6-35B-A3B family** (incl. hybrid GDN + MTP head, e.g. [Ornith-1.0-35B](https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B)) | MXFP4 (native kernel) | ✅ production — 111 tok/s @7k ctx w/ MTP, 262k context |
+| **Muse Glimmer 30B** (multimodal) | FP8 | ✅ validated — serving, tool-calling (`muse_glimmer` parsers), agentic use; DFlash drafter integration in validation |
+| **Qwen 3.8-27B** | FP8 planned | 🎯 targeted — image gates will extend the day weights ship |
+
+Anything upstream vLLM runs on ROCm also works here unchanged; the value of
+this fork is the native MXFP4 path and the spec-decode fixes on top.
+
+## Want another model? Open an issue
+
+Happy to look at adding/validating more models — [open an issue](../../issues)
+with the checkpoint link. Practical constraint: it has to fit **64 GB of VRAM
+total** (weights + KV cache), so realistically ≤~40B dense at FP8/W4, or MoE up
+to the ~35B-A3B class at 4-bit, with context budget scaling accordingly. No
+promises on timelines — this is a one-person fork-carry effort — but well-scoped
+requests with a public checkpoint get tried.
+
 ## Validation summary
 
 Engine A/B vs the previous production engine (same weights, same sampling):
