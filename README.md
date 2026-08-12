@@ -34,7 +34,7 @@ R9700; a single 32 GB card fits the smaller quants at reduced context.
 
 | model | quant | status |
 |---|---|---|
-| **Qwen3.5/3.6-35B-A3B family** (incl. hybrid GDN + MTP head, e.g. [Ornith-1.0-35B](https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B)) | MXFP4 (native kernel) | ✅ production — 111 tok/s @7k ctx w/ MTP, 262k context |
+| **Qwen3.5/3.6-35B-A3B family** (incl. hybrid GDN + MTP head) | MXFP4 (native kernel) | ✅ **in production TODAY serving [Ornith-1.0-35B](https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B)** behind a real business assistant — 111 tok/s @7k ctx w/ MTP, 262k context |
 | **Muse Glimmer 30B** (multimodal) | FP8 | ✅ validated — serving, tool-calling (`muse_glimmer` parsers), agentic use; DFlash drafter integration in validation |
 | **Gemma 4 26B-A4B-it** | NVFP4 (native RDNA4 MoE patches) | ✅ validated — MTP assistant backport, 256k context; full recipe in [`gemma-nvfp4/`](../../tree/rdna4/gemma-nvfp4) |
 | **Qwen 3.8-27B** | FP8 planned | 🎯 targeted — image gates will extend the day weights ship |
@@ -113,6 +113,9 @@ promises on timelines — this is a one-person fork-carry effort — but well-sc
 requests with a public checkpoint get tried.
 
 ## Validation summary
+
+Full results — concurrency sweeps, the 8-bench engine A/B, and the long-context
+"compaction" ladder — plus the reproduction tools live in [`validation/`](../../tree/rdna4/validation).
 
 Engine A/B vs the previous production engine (same weights, same sampling):
 greedy outputs byte-identical at 6–7k context; 7-bench quality gate (IFEval
