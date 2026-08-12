@@ -42,6 +42,67 @@ R9700; a single 32 GB card fits the smaller quants at reduced context.
 Anything upstream vLLM runs on ROCm also works here unchanged; the value of
 this fork is the native MXFP4 path and the spec-decode fixes on top.
 
+## Serving recipes (validated configs)
+
+Both use the published image; the fork's images have **no entrypoint** — pass it
+explicitly. `--generation-config auto` (the default) adopts each checkpoint's
+recommended sampling for anything the request doesn't override.
+
+### Qwen3.5/3.6-35B-A3B family · MXFP4 · MTP spec decode (production config)
+
+```bash
+docker run --rm --network=host --device=/dev/kfd --device=/dev/dri \
+  --group-add=video --group-add=render --ipc=host \
+  -v /path/to/models:/models -v hf-cache:/root/.cache/huggingface \
+  --entrypoint /usr/local/bin/vllm \
+  capicua25x/vllm-rocm-rdna4:glimmer-qwen38-rc5 \
+  serve /models/<qwen3.5-or-3.6-35B-A3B-MXFP4> \
+  --trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.92 \
+  --max-model-len 262144 --attention-backend TRITON_ATTN \
+  --enable-prefix-caching --max-num-seqs 64 --max-num-batched-tokens 16384 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
+```
+
+Gotchas this config encodes (each cost a debugging session):
+- **`"attention_backend":"TRITON_ATTN"` inside the speculative config is mandatory** —
+  the drafter does *not* inherit `--attention-backend` (upstream design) and
+  auto-selects a native paged kernel that collapses on the 1072-token pages
+  hybrid models force (3.2 ms/launch).
+- **`--max-num-batched-tokens 16384`**: with a speculative config present, the
+  scheduler budget silently pins low and ~6k prompts split into multiple passes.
+- Measured on 2×R9700: 111 tok/s at 7k-context decode, 123 short, 262k context,
+  ~128-user short-prompt ceiling.
+
+### Muse Glimmer 30B · FP8 · ATEM tool-calling
+
+```bash
+docker run --rm --network=host --device=/dev/kfd --device=/dev/dri \
+  --group-add=video --group-add=render --ipc=host \
+  -v /path/to/models:/models -v hf-cache:/root/.cache/huggingface \
+  --entrypoint /usr/local/bin/vllm \
+  capicua25x/vllm-rocm-rdna4:glimmer-qwen38-rc5 \
+  serve /models/<Muse-Glimmer-30B-FP8> \
+  --trust-remote-code --tensor-parallel-size 2 --gpu-memory-utilization 0.92 \
+  --max-model-len 32768 --max-num-seqs 32 --enable-prefix-caching \
+  --max-num-batched-tokens 16384 \
+  --enable-auto-tool-choice --tool-call-parser muse_glimmer \
+  --reasoning-parser muse_glimmer \
+  --default-chat-template-kwargs '{"reasoning_strength": "low"}'
+```
+
+Gotchas:
+- **Both `muse_glimmer` parsers are mandatory.** Glimmer speaks the ATEM channel
+  protocol (`to=self` reasoning, `<atem:invoke>` tools); with generic parsers
+  (e.g. `hermes`) the channel markers leak into `content` and every structured
+  task fails while *looking* fluent.
+- **`reasoning_strength` defaults to `high`** in the chat template and will eat
+  small `max_tokens` budgets whole (all reasoning, empty answer). `low` is the
+  sane serving default; override per request via `chat_template_kwargs`.
+- The official DFlash drafter (`meta-models/Muse-Glimmer-30B-assistant`, 16-token
+  blocks) is supported by this branch line; our integration is still in
+  validation — recipe lands here once measured.
+
 ## Want another model? Open an issue
 
 Happy to look at adding/validating more models — [open an issue](../../issues)
