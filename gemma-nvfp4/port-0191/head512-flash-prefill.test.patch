@@ -1,0 +1,339 @@
+diff --git a/tests/kernels/attention/test_triton_unified_attention.py b/tests/kernels/attention/test_triton_unified_attention.py
+index 99cdc7f..0346a7e 100644
+--- a/tests/kernels/attention/test_triton_unified_attention.py
++++ b/tests/kernels/attention/test_triton_unified_attention.py
+@@ -221,6 +221,334 @@ def test_triton_unified_attn(
+     )
+ 
+ 
++# ── KV-split large-query (cold-prefill fix) parity gate ──────────────────────
++# The existing suite is GREEN-BLIND to the 3D split-KV kernel at query_len>1: it
++# is reached only by the all-(1, kv) decode cases above. The cold-prefill fix
++# routes LARGE-query prefill chunks (BLOCK_Q>1, multi-query-per-tile) through the
++# 3D kernel, which forces the never-validated per-row divergent active-segment
++# online-softmax merge in reduce_segments. This test closes that gap: it runs the
++# SAME inputs through the 2D kernel (reference) and the 3D kernel (seq_threshold_3D
++# sized to admit the whole prefill chunk) and asserts tight 2D-vs-3D parity — any
++# gap is a structural split/merge bug, since both are identical bf16+fp32 math.
++# head_size=512 is included on purpose: it is the Gemma-4 full-attention head and
++# proves the 3D path fits RDNA4's 64KiB LDS at TILE=32 (the layer the fix targets).
++LARGE_Q_SEQ_LENS = [
++    [(8, 2048)],  # single seq, multi-query, deep KV -> all 16 segments multi-tile
++    [(4, 1031), (4, 4099)],  # mixed depths, two seqs
++    [(16, 8192)],  # widest BLOCK_M packing x deepest KV
++    [(2, 600), (3, 257), (1, 19)],  # ragged; (3,257) flips a partially-masked tail seg
++]
++
++
++@pytest.mark.parametrize("seq_lens", LARGE_Q_SEQ_LENS)
++@pytest.mark.parametrize("num_heads", NUM_HEADS)  # (5,1) -> BLOCK_Q=3, worst packing
++@pytest.mark.parametrize("head_size", [128, 256, 512])
++@pytest.mark.parametrize("block_size", BLOCK_SIZES)
++# sliding_window smaller than the query span over deep KV forces a fully
++# SW-masked tail segment for early rows -> exercises the m_j=-inf / expsum==0 guards
++@pytest.mark.parametrize("sliding_window", [None, 64, 256])
++@pytest.mark.parametrize("soft_cap", [None, 50.0])
++@torch.inference_mode()
++def test_triton_unified_attn_3d_large_query(
++    seq_lens: list[tuple[int, int]],
++    num_heads: tuple[int, int],
++    head_size: int,
++    sliding_window: int | None,
++    block_size: int,
++    soft_cap: float | None,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    import vllm.v1.attention.ops.triton_unified_attention as tua
++
++    # _ALLOW_3D_SMALL_QLEN is read ONCE at import from the env, so setting the env
++    # var would silently no-op here; patch the module attribute directly. With it
++    # True, the 2D/3D gate becomes purely capacity-based (_use_2d = q.shape[0] >
++    # seq_threshold_3D), letting query_len>1 ride the 3D kernel.
++    monkeypatch.setattr(tua, "_ALLOW_3D_SMALL_QLEN", True)
++
++    # NOTE: this test intentionally does NOT exercise multimodal (mm_prefix) prefill.
++    # The 3D split-KV kernel has no USE_MM_PREFIX branch, so the dispatcher forces any
++    # use_mm_prefix chunk onto the 2D path (see the gate in triton_unified_attention.py).
++    # The 3D kernel is therefore unreachable with mm_prefix and there is nothing new to
++    # differentially verify there; the text-prefill cases below are the 3D coverage.
++    torch.set_default_device("cuda")
++    set_random_seed(0)
++
++    num_seqs = len(seq_lens)
++    query_lens = [x[0] for x in seq_lens]
++    kv_lens = [x[1] for x in seq_lens]
++    num_query_heads, num_kv_heads = num_heads
++    assert num_query_heads % num_kv_heads == 0
++    total_q = sum(query_lens)
++    max_query_len = max(query_lens)
++    max_kv_len = max(kv_lens)
++    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
++    scale = head_size**-0.5
++    dtype = torch.bfloat16
++    num_blocks = 32768
++
++    query = torch.randn(total_q, num_query_heads, head_size, dtype=dtype)
++    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
++    value_cache = torch.randn_like(key_cache)
++    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
++        dim=0, dtype=torch.int32
++    )
++    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
++    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
++    block_tables = torch.randint(
++        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
++    )
++
++    num_par_softmax_segments = 16
++    head_size_padded = next_power_of_2(head_size)
++
++    # Mirror prod exactly: seq_threshold_3D stays small (decode-sized), and the segm
++    # buffers are grown to admit the whole chunk. That makes the dispatch pick the 3D
++    # kernel (q.shape[0] <= buffer cap) AND the prefill tile (q.shape[0] > seq_threshold_3D
++    # -> TILE_SIZE_PREFILL, not TILE_SIZE_DECODE) — the genuine cold-prefill code path.
++    SMALL_THR = 4  # < every total_q below, so the prefill-tile branch is exercised
++    assert total_q > SMALL_THR
++
++    def run(seq_threshold_3D: int, cap: int) -> torch.Tensor:
++        segm_output = torch.empty(
++            (cap, num_query_heads, num_par_softmax_segments, head_size_padded),
++            dtype=torch.float32,
++        )
++        segm_max = torch.empty(
++            (cap, num_query_heads, num_par_softmax_segments), dtype=torch.float32
++        )
++        segm_expsum = torch.empty_like(segm_max)
++        # fp32 out so the 2D-vs-3D differential compares the raw fp32 accumulators.
++        # bf16 out would round both legs to ~7.8e-3 ULP near 1.0, well above the 2e-3
++        # parity tolerance, making the assert a coin flip (W4). The kernel stores its
++        # fp32 acc directly when out is fp32 (USE_FP8 is False here), so no precision
++        # is lost vs the production bf16 store — production correctness is still covered
++        # by the looser ref_paged_attn comparison below.
++        out = torch.empty(
++            (total_q, num_query_heads, head_size),
++            dtype=torch.float32,
++            device=query.device,
++        )
++        unified_attention(
++            q=query,
++            k=key_cache,
++            v=value_cache,
++            out=out,
++            cu_seqlens_q=cu_query_lens,
++            seqused_k=kv_lens_t,
++            max_seqlen_q=max_query_len,
++            max_seqlen_k=max_kv_len,
++            softmax_scale=scale,
++            causal=True,
++            window_size=window_size,
++            block_table=block_tables,
++            softcap=soft_cap if soft_cap is not None else 0,
++            q_descale=None,
++            k_descale=None,
++            v_descale=None,
++            seq_threshold_3D=seq_threshold_3D,
++            num_par_softmax_segments=num_par_softmax_segments,
++            softmax_segm_output=segm_output,
++            softmax_segm_max=segm_max,
++            softmax_segm_expsum=segm_expsum,
++        )
++        return out
++
++    # 2D leg: cap=1 so q.shape[0] > buffer cap -> _use_2d=True (the reference).
++    out_2d = run(seq_threshold_3D=0, cap=1)
++    # 3D leg: small threshold + buffers grown to total_q -> 3D kernel, prefill tile.
++    out_3d = run(seq_threshold_3D=SMALL_THR, cap=total_q)
++
++    ref_output = ref_paged_attn(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        kv_lens=kv_lens,
++        block_tables=block_tables,
++        scale=scale,
++        sliding_window=sliding_window,
++        soft_cap=soft_cap,
++    )
++
++    # Tight 2D-vs-3D differential: both legs accumulate in fp32 and we now store fp32,
++    # so any gap is a real split/merge bug, not bf16 rounding noise. ref_paged_attn
++    # (looser, bf16) catches gross errors; check_dtype=False since out is fp32 vs ref bf16.
++    torch.testing.assert_close(
++        out_3d, out_2d, atol=2e-3, rtol=2e-3,
++        msg=lambda m: f"2D-vs-3D parity broke: max|d|={torch.max(torch.abs(out_3d - out_2d))}\n{m}",
++    )
++    torch.testing.assert_close(out_3d, ref_output, atol=1.5e-2, rtol=1e-2, check_dtype=False)
++    torch.testing.assert_close(out_2d, ref_output, atol=1.5e-2, rtol=1e-2, check_dtype=False)
++
++
++# ── Head-512 flash-prefill (VLLM_FA_HEADCHUNK) parity gate ───────────────────
++# The chunked head-512 kernel (kernel_unified_attention_2d_headchunk) chunks BOTH the
++# QK contraction and the PV output in HEAD_CHUNK-wide head slices so the full 512-deep
++# K/V is never staged (RDNA4 LDS-occupancy fix; ~3.5x faster cold prefill, validated
++# 2026-06-27). It is mathematically identical to the monolithic 2D kernel. This test
++# closes the regression gap: SAME inputs through the monolithic 2D kernel (_FA_HEADCHUNK
++# =0, reference) and the chunked kernel (_FA_HEADCHUNK=64), asserting tight fp32 parity —
++# any gap is a chunk-split/accumulate bug (head slicing, per-chunk fp8 dequant, the
++# 8-tuple PV accumulators, or the per-chunk store), since both are identical fp32 math.
++# head_size is 512 only (the Gemma-4 full-attention head the kernel is gated to).
++HEADCHUNK_SEQ_LENS = [
++    [(8, 2048)],  # single seq, multi-query prefill, deep KV (many head-chunk x KV tiles)
++    [(4, 1031), (4, 4099)],  # mixed depths, two seqs
++    [(1, 523), (1, 37), (1, 2011)],  # decode-shaped (query_len==1) — chunked path must also be correct here
++    [(2, 600), (3, 257), (1, 19)],  # ragged
++]
++
++
++# Matrix is deliberately small: the head-512 chunked kernel is 8-way unrolled and each distinct
++# constexpr combo is a separate multi-minute Triton JIT, so cold CI cost is ~(num_heads x q_dtype)
++# heavy compiles. Coverage rationale:
++#   - num_heads: two GQA packings -- (8,2)=prod-like nqpkv=4, (5,1)=worst packing (BLOCK_Q=3).
++#   - q_dtype:  None AND fp8 -- fp8 is chunk-SPECIFIC (per-head-chunk dequant in _pv_chunk/_store_chunk),
++#               so it must be in the chunk-vs-mono differential.
++#   - seq_lens: 4 shapes (deep prefill / mixed / decode / ragged) are free -- runtime-only, no recompile.
++#   - sliding_window / soft_cap are intentionally NOT cross-producted here: they modify the SHARED
++#     softmax+mask+softcap block, which is byte-identical in the chunked and monolithic kernels (only QK
++#     and PV are chunked). Their correctness is already covered by test_triton_unified_attn on the stock
++#     kernel; adding them here would only multiply compile cost without exercising chunk-specific code.
++@pytest.mark.parametrize("seq_lens", HEADCHUNK_SEQ_LENS)
++@pytest.mark.parametrize("num_heads", [(8, 2), (5, 1)])
++@pytest.mark.parametrize("head_size", [512])
++@pytest.mark.parametrize("block_size", BLOCK_SIZES)
++@pytest.mark.parametrize("sliding_window", [None])
++@pytest.mark.parametrize("soft_cap", [None])
++@pytest.mark.parametrize("q_dtype", QDTYPES)
++@torch.inference_mode()
++def test_triton_unified_attn_headchunk(
++    seq_lens: list[tuple[int, int]],
++    num_heads: tuple[int, int],
++    head_size: int,
++    sliding_window: int | None,
++    block_size: int,
++    soft_cap: float | None,
++    q_dtype: torch.dtype | None,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    import vllm.v1.attention.ops.triton_unified_attention as tua
++
++    # The (5,1) GQA packing (num_queries_per_kv=5, BLOCK_Q=3) COMBINED with fp8 inputs triggers a
++    # pathologically slow Triton/LLVM JIT for the 8-way-unrolled head-512 kernel (minutes per compile).
++    # It is not a prod packing (Gemma full-attn at TP2 is num_queries_per_kv=8), the fp8 scale handling
++    # is packing-independent (covered by the (8,2) fp8 cases), and (5,1) is still exercised non-fp8 as the
++    # worst-packing chunking check. Skip only this one slow cell.
++    if q_dtype is not None and num_heads == (5, 1):
++        pytest.skip("(5,1)+fp8: slow Triton JIT for the unrolled head-512 kernel; fp8 covered by (8,2)")
++
++    # _FA_HEADCHUNK is read ONCE at import; patch the module attribute to toggle the path.
++    torch.set_default_device("cuda")
++    set_random_seed(0)
++
++    num_seqs = len(seq_lens)
++    query_lens = [x[0] for x in seq_lens]
++    kv_lens = [x[1] for x in seq_lens]
++    num_query_heads, num_kv_heads = num_heads
++    assert num_query_heads % num_kv_heads == 0
++    total_q = sum(query_lens)
++    max_query_len = max(query_lens)
++    max_kv_len = max(kv_lens)
++    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
++    scale = head_size**-0.5
++    dtype = torch.bfloat16
++    num_blocks = 32768
++
++    query = torch.randn(total_q, num_query_heads, head_size, dtype=dtype)
++    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
++    value_cache = torch.randn_like(key_cache)
++    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
++        dim=0, dtype=torch.int32
++    )
++    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
++    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
++    block_tables = torch.randint(
++        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
++    )
++
++    maybe_q = query
++    maybe_k = key_cache
++    maybe_v = value_cache
++    k_descale = None
++    v_descale = None
++    if q_dtype is not None:
++        maybe_q = query.to(q_dtype)
++        maybe_k = key_cache.to(q_dtype)
++        maybe_v = value_cache.to(q_dtype)
++        scale_shape = (num_seqs, num_kv_heads)
++        k_descale = torch.rand(scale_shape, dtype=torch.float32)
++        v_descale = torch.rand(scale_shape, dtype=torch.float32)
++
++    num_par_softmax_segments = 16
++    head_size_padded = next_power_of_2(head_size)
++    # seq_threshold_3D=0 -> 0-sized segm buffers (proven-safe form, matches test_triton_unified_attn);
++    # forces the 2D path for BOTH legs, isolating the chunked-vs-monolithic comparison.
++    segm_output = torch.empty(
++        (0, num_query_heads, num_par_softmax_segments, head_size_padded), dtype=torch.float32
++    )
++    segm_max = torch.empty((0, num_query_heads, num_par_softmax_segments), dtype=torch.float32)
++    segm_expsum = torch.empty_like(segm_max)
++
++    def run(fa_headchunk: int) -> torch.Tensor:
++        monkeypatch.setattr(tua, "_FA_HEADCHUNK", fa_headchunk)
++        # fp32 out so the chunked-vs-monolithic differential compares raw fp32 accumulators
++        # (bf16 rounding near 1.0 would swamp a true ~2e-3 parity check).
++        out = torch.empty(
++            (total_q, num_query_heads, head_size), dtype=torch.float32, device=query.device
++        )
++        tua.unified_attention(
++            q=maybe_q,
++            k=maybe_k,
++            v=maybe_v,
++            out=out,
++            cu_seqlens_q=cu_query_lens,
++            seqused_k=kv_lens_t,
++            max_seqlen_q=max_query_len,
++            max_seqlen_k=max_kv_len,
++            softmax_scale=scale,
++            causal=True,
++            window_size=window_size,
++            block_table=block_tables,
++            softcap=soft_cap if soft_cap is not None else 0,
++            q_descale=None,
++            k_descale=k_descale,
++            v_descale=v_descale,
++            seq_threshold_3D=0,
++            num_par_softmax_segments=num_par_softmax_segments,
++            softmax_segm_output=segm_output,
++            softmax_segm_max=segm_max,
++            softmax_segm_expsum=segm_expsum,
++        )
++        return out
++
++    out_mono = run(0)  # monolithic 2D kernel (reference)
++    out_chunk = run(64)  # chunked head-512 kernel
++
++    ref_output = ref_paged_attn(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        kv_lens=kv_lens,
++        block_tables=block_tables,
++        scale=scale,
++        sliding_window=sliding_window,
++        soft_cap=soft_cap,
++    )
++
++    # Tight chunked-vs-monolithic differential (both fp32). fp8 widens the per-chunk dequant
++    # rounding, so loosen the parity tolerance there but keep it well under the ref tolerance.
++    par_atol, par_rtol = (2e-3, 2e-3) if q_dtype is None else (5e-2, 5e-2)
++    torch.testing.assert_close(
++        out_chunk, out_mono, atol=par_atol, rtol=par_rtol,
++        msg=lambda m: f"chunked-vs-mono parity broke: max|d|={torch.max(torch.abs(out_chunk - out_mono))}\n{m}",
++    )
++    ref_atol, ref_rtol = (1.5e-2, 1e-2) if q_dtype is None else (1.5e-1, 1.5e-1)
++    torch.testing.assert_close(out_chunk, ref_output, atol=ref_atol, rtol=ref_rtol, check_dtype=False)
++
++
+ @pytest.mark.parametrize(
+     "seq_lens",
+     [

@@ -1,0 +1,701 @@
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+index 35451e8..5fc36ae 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+@@ -40,6 +40,9 @@ class NvFp4MoeBackend(Enum):
+     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
+     VLLM_CUTLASS = "VLLM_CUTLASS"
+     MARLIN = "MARLIN"
++    # RDNA3 (gfx11) / RDNA4 (gfx12): hand-built Triton fused-MoE kernel.
++    # Used when no NVIDIA backend (FlashInfer / CUTLASS / Marlin) is available.
++    RDNA_TRITON = "RDNA_TRITON"
+ 
+ 
+ FLASHINFER_NVFP4_MOE_BACKENDS = [
+@@ -105,6 +108,13 @@ def backend_to_kernel_cls(
+         )
+ 
+         return [MarlinExperts]
++
++    elif backend == NvFp4MoeBackend.RDNA_TRITON:
++        from vllm.model_executor.layers.fused_moe.experts.rdna_nvfp4_moe import (
++            RdnaNvFp4ExpertsMonolithic,
++        )
++
++        return [RdnaNvFp4ExpertsMonolithic]
+     else:
+         raise ValueError(f"Unknown NvFP4 MoE backend: {backend.value}")
+ 
+@@ -191,6 +201,19 @@ def select_nvfp4_moe_backend(
+ 
+         raise ValueError(_make_log_unsupported(backend, reason))
+ 
++    # ── FIRST CHECK ─────────────────────────────────────────────────────────
++    # AMD RDNA3/RDNA4 (gfx11 / gfx12): no FlashInfer / CUTLASS / Marlin kernels
++    # are available on ROCm RDNA. Short-circuit to the hand-built Triton fused
++    # NVFP4 MoE kernel before considering any NVIDIA backend.
++    from vllm.platforms import current_platform as _cp
++    if _cp.is_rocm():
++        from vllm.platforms.rocm import on_gfx1x
++        if on_gfx1x():
++            return _return_or_raise(
++                NvFp4MoeBackend.RDNA_TRITON,
++                config, weight_key, activation_key, activation_format,
++            )
++
+     # Handle explicit moe_backend from user.
+     runner_backend = config.moe_backend
+     if runner_backend != "auto":
+@@ -331,6 +354,12 @@ def convert_to_nvfp4_moe_kernel_format(
+             w2_scale_2=w2_scale_2,
+             is_act_and_mul=is_act_and_mul,
+         )
++    elif nvfp4_backend == NvFp4MoeBackend.RDNA_TRITON:
++        # RDNA3 / RDNA4 hand-built Triton fused-MoE kernel.
++        # Pass-through: scales stay fp8_e4m3fn (native NVFP4 format, 1 byte/group),
++        # w_scale_2 (= 1/w_global_scale) stays fp32. Kernel converts fp8->fp32 inline
++        # and folds w_scale_2 per-expert. No swizzle, no pre-bake, no fidelity loss.
++        pass
+     else:
+         raise ValueError(f"Unknown NvFp4 backend for MoE: {nvfp4_backend}")
+ 
+@@ -363,6 +392,21 @@ def make_nvfp4_moe_quant_config(
+             w2_scale=w2_scale,
+         )
+ 
++    if backend == NvFp4MoeBackend.RDNA_TRITON:
++        # RDNA hand-built Triton kernel reads scales as-is:
++        #   - w_scale: fp8_e4m3fn, LINEAR layout (no swizzle)
++        #   - g_alphas: fp32 [E] (1/w_global_scale, folded in-kernel per expert)
++        #   - a_gscale: fp32 [E] (1/a_global_scale, used for activation quant)
++        return nvfp4_moe_quant_config(
++            g1_alphas=w13_scale_2,
++            g2_alphas=w2_scale_2,
++            a1_gscale=(1.0 / a13_scale),
++            a2_gscale=(1.0 / a2_scale),
++            w1_scale=w13_scale,
++            w2_scale=w2_scale,
++            is_nvfp4_scale_swizzled=False,
++        )
++
+     # Pass w13_scale_2 / w2_scale_2 directly as g1/g2_alphas.
+     # The expert's process_weights_after_loading will fuse activation
+     # scales in-place. Since the quant config references the same tensor
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py
+index a3b5362..8160fb3 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py
+@@ -8,6 +8,9 @@ from torch.nn.parameter import Parameter
+ from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+     CompressedTensorsScheme,
+ )
++from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
++    invoke_nvfp4_linear_kernel,
++)
+ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+     apply_nvfp4_linear,
+     convert_to_nvfp4_linear_kernel_format,
+@@ -24,7 +27,17 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
+ 
+ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
+     def __init__(self):
+-        self.backend = select_nvfp4_linear_backend()
++        # RDNA3 / RDNA4 has no NVFP4 linear backend available (no FlashInfer,
++        # no CUTLASS FP4, no Marlin FP4 repack op in ROCm builds). Short-circuit
++        # before select_nvfp4_linear_backend() is called — otherwise it logs a
++        # misleading "Using Marlin" warning and the loader later crashes on
++        # `torch.ops._C.gptq_marlin_repack` which is not compiled into ROCm.
++        from vllm.platforms import current_platform
++        _rdna = False
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1x
++            _rdna = on_gfx1x()
++        self.backend = None if _rdna else select_nvfp4_linear_backend()
+         self.group_size = 16
+ 
+     @classmethod
+@@ -86,6 +99,38 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
+         layer.register_parameter("input_global_scale", input_global_scale)
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        # RDNA3/RDNA4: no NVFP4-capable linear backend on ROCm RDNA (no
++        # FlashInfer, no CUTLASS FP4, no Marlin repack). Use a Triton kernel
++        # that keeps weights packed as uint8 and dequants at runtime.
++        from vllm.platforms import current_platform
++        if current_platform.is_rocm():
++            from vllm.platforms.rocm import on_gfx1x
++            if on_gfx1x():
++                self._rdna_runtime_dequant = True
++                # Keep packed weights in VRAM; dequant at runtime in Triton.
++                w_gscale_inv = (
++                    1.0 / layer.weight_global_scale.max()
++                ).to(torch.float32)
++                layer.weight = Parameter(
++                    layer.weight_packed.data.contiguous(),
++                    requires_grad=False,
++                )
++                del layer.weight_packed
++                layer.weight_scale = Parameter(
++                    layer.weight_scale.data.contiguous(),
++                    requires_grad=False,
++                )
++                layer.weight_global_scale_inv = Parameter(
++                    w_gscale_inv, requires_grad=False
++                )
++                for name in (
++                    "weight_global_scale",
++                    "input_global_scale",
++                ):
++                    if hasattr(layer, name):
++                        delattr(layer, name)
++                return
++
+         # Rename CT checkpoint names to standardized names
+         layer.weight = layer.weight_packed
+         del layer.weight_packed
+@@ -116,6 +161,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if getattr(self, "_rdna_runtime_dequant", False):
++            return invoke_nvfp4_linear_kernel(
++                x, layer.weight, layer.weight_scale,
++                layer.weight_global_scale_inv, bias,
++            )
++
+         return apply_nvfp4_linear(
+             backend=self.backend,
+             layer=layer,
+diff --git a/vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py b/vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py
+index 62b4802..d1a4f6c 100644
+--- a/vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import torch
++import triton
++import triton.language as tl
+ 
+ from vllm.scalar_type import scalar_types
+ 
+@@ -8,10 +10,17 @@ __all__ = [
+     "break_fp4_bytes",
+     "dequantize_to_dtype",
+     "ref_nvfp4_quant",
++    "fused_moe_nvfp4_kernel",
++    "invoke_fused_moe_nvfp4_kernel",
++    "nvfp4_linear_kernel",
++    "invoke_nvfp4_linear_kernel",
++    "NVFP4_BLOCK_SIZE",
+ ]
+ 
+ FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
+ 
++NVFP4_BLOCK_SIZE = 16
++
+ kE2M1ToFloat = torch.tensor(
+     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+ )
+@@ -140,3 +149,501 @@ def run_nvfp4_emulations(
+     out = torch.matmul(x_dq, w_dq.t())
+     del w_dq, x_dq
+     return out
++
++
++# =============================================================================
++# Fused NVFP4 MoE Kernel - dequant + matmul in single Triton kernel
++#
++# Hand-built for AMD ROCm (gfx11/gfx12, RDNA3/RDNA4) where no NVIDIA-specific
++# FP4 tensor-core path exists. Uses LINEAR scale layout (no swizzling).
++#
++# Scale format (native NVFP4):
++#   b_scale       : fp8_e4m3fn, shape [E, N, K//16]  per-group block scales
++#   b_scale_global: fp32,        shape [E]            1 / w_global_scale
++#
++# Kernel dequant pipeline (per element):
++#   fp8_scale  -> fp32  (tl cast)
++#   effective  = fp32_scale * b_scale_global[expert]
++#   weight_val = fp4_e2m1 decode * effective
++# =============================================================================
++
++
++@triton.jit
++def fused_moe_nvfp4_kernel(
++    a_ptr,
++    b_packed_ptr,
++    c_ptr,
++    b_scale_ptr,
++    b_scale_global_ptr,
++    topk_weights_ptr,
++    sorted_token_ids_ptr,
++    expert_ids_ptr,
++    num_tokens_post_padded_ptr,
++    N,
++    K,
++    EM,
++    num_valid_tokens,
++    stride_am,
++    stride_ak,
++    stride_bpe,
++    stride_bpn,
++    stride_bpk,
++    stride_cm,
++    stride_cn,
++    stride_bse,
++    stride_bsn,
++    stride_bsk,
++    stride_bsge,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    MUL_ROUTED_WEIGHT: tl.constexpr,
++    top_k: tl.constexpr,
++    compute_type: tl.constexpr,
++):
++    tl.static_assert(BLOCK_SIZE_K % 16 == 0, "BLOCK_SIZE_K must be multiple of 16")
++
++    pid = tl.program_id(axis=0)
++    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
++    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
++    num_pid_in_group = GROUP_SIZE_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_SIZE_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
++    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
++        return
++
++    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
++    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
++    token_mask = offs_token < num_valid_tokens
++
++    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
++
++    if off_experts == -1:
++        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++        c_ptrs = c_ptr + offs_token[:, None] * stride_cm + offs_cn[None, :] * stride_cn
++        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
++        tl.store(
++            c_ptrs,
++            tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type),
++            mask=c_mask,
++        )
++        return
++
++    # Per-expert global weight scale (= 1 / w_global_scale). Loaded once and
++    # narrowed to compute_type so the K-loop stays in fp16 / bf16 end-to-end.
++    scale_global = tl.load(b_scale_global_ptr + off_experts * stride_bsge)
++    scale_global = scale_global.to(compute_type)
++
++    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
++    offs_am_k = tl.arange(0, BLOCK_SIZE_K)
++    # Native packed layout: one unique byte per K-row (holds two E2M1 values).
++    offs_bk_packed = tl.arange(0, BLOCK_SIZE_K // 2)
++    # Native scale layout: one fp8 scale per 16 K elements.
++    offs_bk_scale = tl.arange(0, BLOCK_SIZE_K // 16)
++
++    a_ptrs = a_ptr + (
++        offs_token[:, None] // top_k * stride_am + offs_am_k[None, :] * stride_ak
++    )
++
++    b_packed_ptrs = (
++        b_packed_ptr
++        + off_experts * stride_bpe
++        + offs_bn[None, :] * stride_bpn
++        + offs_bk_packed[:, None] * stride_bpk
++    )
++
++    b_scale_ptrs = (
++        b_scale_ptr
++        + off_experts * stride_bse
++        + offs_bn[None, :] * stride_bsn
++        + offs_bk_scale[:, None] * stride_bsk
++    )
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++
++    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
++        k_start = k * BLOCK_SIZE_K
++        k_remaining = K - k_start
++
++        k_mask = offs_am_k < k_remaining
++
++        a = tl.load(
++            a_ptrs,
++            mask=token_mask[:, None] & k_mask[None, :],
++            other=0.0,
++        )
++
++        k_packed_mask = offs_bk_packed < ((k_remaining + 1) // 2)
++        b_packed = tl.load(
++            b_packed_ptrs,
++            mask=k_packed_mask[:, None],
++            other=0,
++        )  # [BLOCK_K // 2, BLOCK_N]
++
++        # Scale: fp8_e4m3fn native. On gfx12 this is a single V_CVT_*_FP8
++        # instruction; on gfx11 Triton emits a software decode. Fold in the
++        # per-expert global scale inline.
++        # NOTE: `other=0.0` (float, not int) — Triton requires a float zero so
++        # the default value can cast into fp8e4m3fn. A bare `0` is int32 and
++        # triggers "cannot cast int32 to fp8e4nv" at compile time.
++        k_scale_mask = offs_bk_scale < tl.cdiv(k_remaining, 16)
++        b_scale_fp8 = tl.load(
++            b_scale_ptrs,
++            mask=k_scale_mask[:, None],
++            other=0.0,
++        )  # [BLOCK_K // 16, BLOCK_N]
++        b_scale_group = b_scale_fp8.to(compute_type) * scale_global
++
++        # Transpose so K is the last axis (required for tl.interleave).
++        # Both transposes are register-resident shuffles, not memory ops.
++        b_packed_t = tl.trans(b_packed)        # [BLOCK_N, BLOCK_K // 2]
++        b_scale_gt = tl.trans(b_scale_group)   # [BLOCK_N, BLOCK_K // 16]
++
++        # Decode both nibbles of each byte in parallel via in-place bit
++        # manipulation (ported from triton_kernels/.../rdna_value.py). Operates
++        # on the packed byte directly — no nibble separation, no int32 promote,
++        # sign bit masked in place and OR'd with the mantissa shift.
++        # E2M1 -> FP16: bias=15, mant=10 bits, denormal ±0.5 at fp16 bits 0x3800
++        em0 = b_packed_t & 0x07                       # low-nibble exp+mant in place
++        em1 = b_packed_t & 0x70                       # high-nibble exp+mant in place
++        x0 = (em0.to(tl.uint16) << 9) | (
++            (b_packed_t & 0x08).to(tl.uint16) << 12
++        )                                              # low-nibble sign merged
++        x1 = (em1.to(tl.uint16) << 5) | (
++            (b_packed_t & 0x80).to(tl.uint16) << 8
++        )                                              # high-nibble sign merged
++        x0 = tl.where((em0 & 0x06) != 0, x0 + (14 << 10), x0)   # add fp16 bias for normals
++        x1 = tl.where((em1 & 0x60) != 0, x1 + (14 << 10), x1)
++        x0 = tl.where(em0 == 0x01, 0x3800 | (x0 & 0x8000), x0)  # denormal ±0.5 patch
++        x1 = tl.where(em1 == 0x10, 0x3800 | (x1 & 0x8000), x1)
++
++        # Byte k packs K=2k in low nibble, K=2k+1 in high. Interleave along the
++        # last (K) axis to restore original K order, then a single bitcast for
++        # the whole tile: [BLOCK_N, BLOCK_K]
++        fp_val_t = tl.interleave(x0, x1).to(tl.float16, bitcast=True)
++
++        # Broadcast [BLOCK_N, BLOCK_K // 16] -> [BLOCK_N, BLOCK_K] by
++        # replicating each scale 16 times. Pure register splat, no extra loads.
++        b_scale_3d = b_scale_gt[:, :, None]
++        b_scale_3d = tl.broadcast_to(
++            b_scale_3d, (BLOCK_SIZE_N, BLOCK_SIZE_K // 16, 16)
++        )
++        b_scale_full_t = tl.reshape(b_scale_3d, (BLOCK_SIZE_N, BLOCK_SIZE_K))
++
++        b_t = (fp_val_t * b_scale_full_t).to(compute_type)
++        b = tl.trans(b_t)  # [BLOCK_K, BLOCK_N]
++        b = tl.where(k_mask[:, None], b, 0.0)
++
++        accumulator += tl.dot(a, b)
++
++        a_ptrs += BLOCK_SIZE_K * stride_ak
++        b_packed_ptrs += (BLOCK_SIZE_K // 2) * stride_bpk
++        b_scale_ptrs += (BLOCK_SIZE_K // 16) * stride_bsk
++
++    if MUL_ROUTED_WEIGHT:
++        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
++        accumulator = accumulator * moe_weight[:, None]
++
++    accumulator = accumulator.to(compute_type)
++
++    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
++    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
++    tl.store(c_ptrs, accumulator, mask=c_mask)
++
++
++def invoke_fused_moe_nvfp4_kernel(
++    A: torch.Tensor,
++    B_packed: torch.Tensor,
++    C: torch.Tensor,
++    B_scale: torch.Tensor,
++    B_scale_global: torch.Tensor,
++    topk_weights: torch.Tensor | None,
++    sorted_token_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_tokens_post_padded: torch.Tensor,
++    mul_routed_weight: bool,
++    top_k: int,
++    config: dict,
++    compute_type: "tl.dtype",
++) -> None:
++    """Launch the fused NVFP4 MoE kernel.
++
++    A:              [M, K] activations (fp16/bf16)
++    B_packed:       [E, N, K//2] uint8 packed NVFP4 weights (two E2M1 per byte)
++    C:              [M, N] output (compute_type)
++    B_scale:        [E, N, K//16] fp8_e4m3fn per-group block scales (LINEAR layout)
++    B_scale_global: [E] fp32, one per expert (= 1 / w_global_scale); folded
++                    inline with B_scale during dequant.
++    """
++    assert B_packed.dtype == torch.uint8, "Weights must be packed uint8"
++    assert B_scale.dtype == torch.float8_e4m3fn, "B_scale must be fp8_e4m3fn"
++    assert B_scale_global.dtype == torch.float32, "B_scale_global must be fp32"
++    assert B_scale_global.ndim == 1, "B_scale_global must be 1-D [E]"
++    assert B_scale_global.size(0) == B_packed.size(0), (
++        "B_scale_global length must equal num experts"
++    )
++    assert topk_weights is not None or not mul_routed_weight
++
++    M = A.size(0)
++    num_tokens = M * top_k
++    E, N, packed_K = B_packed.shape
++    K = packed_K * 2
++
++    EM = sorted_token_ids.size(0)
++    if A.size(0) < config["BLOCK_SIZE_M"]:
++        EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
++
++    grid = lambda META: (
++        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
++    )
++
++    block_k = config.get("BLOCK_SIZE_K", 64)
++    if block_k % 16 != 0:
++        block_k = ((block_k + 15) // 16) * 16
++
++    fused_moe_nvfp4_kernel[grid](
++        A,
++        B_packed,
++        C,
++        B_scale,
++        B_scale_global,
++        topk_weights,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        N,
++        K,
++        EM,
++        num_tokens,
++        A.stride(0),
++        A.stride(1),
++        B_packed.stride(0),
++        B_packed.stride(1),
++        B_packed.stride(2),
++        C.stride(-2),
++        C.stride(-1),
++        B_scale.stride(0),
++        B_scale.stride(1),
++        B_scale.stride(2),
++        B_scale_global.stride(0),
++        MUL_ROUTED_WEIGHT=mul_routed_weight,
++        top_k=top_k,
++        compute_type=compute_type,
++        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
++        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
++        BLOCK_SIZE_K=block_k,
++        GROUP_SIZE_M=config.get("GROUP_SIZE_M", 8),
++    )
++
++
++# =============================================================================
++# NVFP4 Linear Kernel — runtime dequant + matmul for RDNA3/RDNA4
++#
++# Same E2M1→FP16 bit-manipulation dequant as fused_moe_nvfp4_kernel above,
++# but for standard Linear layers (no expert routing). Keeps weights packed
++# as uint8 in VRAM instead of dequanting to bf16 at load time.
++# =============================================================================
++
++_RDNA_NVFP4_LINEAR_DEFAULT_CONFIG = {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 64,
++    "GROUP_SIZE_M": 8,
++}
++
++
++@triton.jit
++def nvfp4_linear_kernel(
++    a_ptr,
++    b_packed_ptr,
++    c_ptr,
++    b_scale_ptr,
++    b_global_scale_ptr,
++    bias_ptr,
++    M, N, K,
++    stride_am, stride_ak,
++    stride_bn, stride_bk,
++    stride_cm, stride_cn,
++    stride_sn, stride_sk,
++    HAS_BIAS: tl.constexpr,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    compute_type: tl.constexpr,
++):
++    tl.static_assert(BLOCK_SIZE_K % 16 == 0,
++                     "BLOCK_SIZE_K must be multiple of 16")
++
++    pid = tl.program_id(axis=0)
++    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
++    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
++    num_pid_in_group = GROUP_SIZE_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_SIZE_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++    offs_bn = (pid_n * BLOCK_SIZE_N
++               + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++    offs_k_packed = tl.arange(0, BLOCK_SIZE_K // 2)
++    offs_k_scale = tl.arange(0, BLOCK_SIZE_K // 16)
++
++    a_ptrs = (a_ptr
++              + offs_am[:, None] * stride_am
++              + offs_k[None, :] * stride_ak)
++    b_packed_ptrs = (b_packed_ptr
++                     + offs_bn[None, :] * stride_bn
++                     + offs_k_packed[:, None] * stride_bk)
++    b_scale_ptrs = (b_scale_ptr
++                    + offs_bn[None, :] * stride_sn
++                    + offs_k_scale[:, None] * stride_sk)
++
++    scale_global = tl.load(b_global_scale_ptr).to(compute_type)
++
++    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++
++    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
++        k_remaining = K - k * BLOCK_SIZE_K
++        k_mask = offs_k < k_remaining
++
++        a = tl.load(
++            a_ptrs,
++            mask=(offs_am[:, None] < M) & k_mask[None, :],
++            other=0.0,
++        )
++
++        k_packed_mask = offs_k_packed < ((k_remaining + 1) // 2)
++        b_packed = tl.load(
++            b_packed_ptrs,
++            mask=k_packed_mask[:, None],
++            other=0,
++        )
++
++        k_scale_mask = offs_k_scale < tl.cdiv(k_remaining, 16)
++        b_scale_fp8 = tl.load(
++            b_scale_ptrs,
++            mask=k_scale_mask[:, None],
++            other=0.0,
++        )
++        b_scale_group = b_scale_fp8.to(compute_type) * scale_global
++
++        b_packed_t = tl.trans(b_packed)
++        b_scale_gt = tl.trans(b_scale_group)
++
++        # E2M1 → FP16 dequant (same bit-manipulation as MoE kernel)
++        em0 = b_packed_t & 0x07
++        em1 = b_packed_t & 0x70
++        x0 = (em0.to(tl.uint16) << 9) | (
++            (b_packed_t & 0x08).to(tl.uint16) << 12
++        )
++        x1 = (em1.to(tl.uint16) << 5) | (
++            (b_packed_t & 0x80).to(tl.uint16) << 8
++        )
++        x0 = tl.where((em0 & 0x06) != 0, x0 + (14 << 10), x0)
++        x1 = tl.where((em1 & 0x60) != 0, x1 + (14 << 10), x1)
++        x0 = tl.where(em0 == 0x01, 0x3800 | (x0 & 0x8000), x0)
++        x1 = tl.where(em1 == 0x10, 0x3800 | (x1 & 0x8000), x1)
++
++        fp_val_t = tl.interleave(x0, x1).to(tl.float16, bitcast=True)
++
++        b_scale_3d = b_scale_gt[:, :, None]
++        b_scale_3d = tl.broadcast_to(
++            b_scale_3d, (BLOCK_SIZE_N, BLOCK_SIZE_K // 16, 16)
++        )
++        b_scale_full_t = tl.reshape(b_scale_3d, (BLOCK_SIZE_N, BLOCK_SIZE_K))
++
++        b_t = (fp_val_t * b_scale_full_t).to(compute_type)
++        b = tl.trans(b_t)
++        b = tl.where(k_mask[:, None], b, 0.0)
++
++        accumulator += tl.dot(a, b)
++
++        a_ptrs += BLOCK_SIZE_K * stride_ak
++        b_packed_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
++        b_scale_ptrs += (BLOCK_SIZE_K // 16) * stride_sk
++
++    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++
++    if HAS_BIAS:
++        bias = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
++        accumulator += bias[None, :]
++
++    result = accumulator.to(compute_type)
++    c_ptrs = (c_ptr
++              + offs_am[:, None] * stride_cm
++              + offs_cn[None, :] * stride_cn)
++    c_mask = (offs_am[:, None] < M) & (offs_cn[None, :] < N)
++    tl.store(c_ptrs, result, mask=c_mask)
++
++
++def invoke_nvfp4_linear_kernel(
++    A: torch.Tensor,
++    B_packed: torch.Tensor,
++    B_scale: torch.Tensor,
++    B_global_scale_inv: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    config: dict | None = None,
++) -> torch.Tensor:
++    """Launch the NVFP4 linear kernel with runtime dequant.
++
++    A:                  [M, K] activations (fp16/bf16)
++    B_packed:           [N, K//2] uint8 packed NVFP4 weights
++    B_scale:            [N, K//16] fp8_e4m3fn per-group block scales
++    B_global_scale_inv: scalar fp32 (= 1 / weight_global_scale)
++    bias:               [N] optional bias
++    """
++    assert B_packed.dtype == torch.uint8
++    assert B_scale.dtype == torch.float8_e4m3fn
++
++    if config is None:
++        config = _RDNA_NVFP4_LINEAR_DEFAULT_CONFIG
++
++    M, K = A.shape
++    N = B_packed.shape[0]
++
++    compute_type = (
++        tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16
++    )
++
++    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
++
++    grid = lambda META: (
++        triton.cdiv(M, META["BLOCK_SIZE_M"])
++        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
++    )
++
++    block_k = config.get("BLOCK_SIZE_K", 64)
++    if block_k % 16 != 0:
++        block_k = ((block_k + 15) // 16) * 16
++
++    nvfp4_linear_kernel[grid](
++        A,
++        B_packed,
++        C,
++        B_scale,
++        B_global_scale_inv,
++        bias if bias is not None else C,
++        M, N, K,
++        A.stride(0), A.stride(1),
++        B_packed.stride(0), B_packed.stride(1),
++        C.stride(0), C.stride(1),
++        B_scale.stride(0), B_scale.stride(1),
++        HAS_BIAS=bias is not None,
++        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
++        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
++        BLOCK_SIZE_K=block_k,
++        GROUP_SIZE_M=config.get("GROUP_SIZE_M", 8),
++        compute_type=compute_type,
++    )
++    return C

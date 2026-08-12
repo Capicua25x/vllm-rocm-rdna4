@@ -1,0 +1,370 @@
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -47,6 +47,16 @@
+ # depth curve. Decode path is untouched. Read once at import.
+ _PREFILL_TILE_OVERRIDE = int(os.environ.get("VLLM_PREFILL_TILE_SIZE", "0"))
+ 
++# Head-512 flash-prefill rewrite (env-gated, default OFF). The head-512 (Gemma full-attn)
++# prefill kernel is LDS-OCCUPANCY-bound on RDNA4 (64KiB/CU): staging the full 512-deep K/V
++# tile pins ~1 resident wave-block. VLLM_FA_HEADCHUNK=64 routes head-512 prefill to a
++# dedicated kernel that chunks BOTH the QK contraction and the PV output in 64-wide head
++# slices, so the full 512-deep K/V is NEVER staged -> LDS collapses (prototype: 65536->6144 B,
++# -91%) -> many resident wave-blocks -> occupancy. Standalone proto proved it bit-identical to
++# the monolithic kernel. 0 = stock monolithic (no behavior change). Only engages for head_size
++# ==512 with no alibi/sinks/qq_bias (always true for Gemma full-attn). KC=64 -> NUM=8 chunks.
++_FA_HEADCHUNK = int(os.environ.get("VLLM_FA_HEADCHUNK", "0"))
++
+ 
+ @triton.jit
+ def cdiv_fn(x, y):
+@@ -433,6 +443,306 @@
+ 
+ 
+ @triton.jit
++def _pv_chunk(
++    acc_c, alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx,
++    seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2,
++    stride_v_cache_3, BLOCK_SIZE: tl.constexpr, HEAD_SIZE: tl.constexpr,
++    HEAD_CHUNK: tl.constexpr, v_scale, QDT, c: tl.constexpr,
++):
++    # PV online-softmax update for output-head chunk c. Loads ONLY a [TILE, HEAD_CHUNK] V-chunk
++    # (the full 512-deep V is never staged), dequants fp8 in-register, rescales + accumulates.
++    dch = c * HEAD_CHUNK + tl.arange(0, HEAD_CHUNK)
++    v_off = (
++        physical_block_idx[:, None] * stride_v_cache_0
++        + kv_head_idx * stride_v_cache_2
++        + dch[None, :] * stride_v_cache_3
++        + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
++    )
++    Vc_load = tl.load(
++        value_cache_ptr + v_off,
++        mask=(dch < HEAD_SIZE)[None, :] & tile_mask[:, None],
++        other=0.0,
++    )
++    if Vc_load.dtype.is_fp8():
++        if P_cast.dtype.is_fp8():
++            # All-fp8 path: mirror the stock 2D kernel — raw fp8 V (P is already fp8 = V.dtype),
++            # v_scale folded into out_scale. Only the Q-not-fp8 prod path dequants V here.
++            Vc = Vc_load
++        else:
++            Vc = (Vc_load.to(tl.float32) * tl.load(v_scale)).to(QDT)
++    else:
++        Vc = Vc_load
++    return acc_c * alpha[:, None] + tl.dot(P_cast, Vc)
++
++
++@triton.jit
++def _store_chunk(
++    output_ptr, acc_c, Li, query_offset_0, query_offset_1, output_stride_0,
++    output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE: tl.constexpr,
++    HEAD_CHUNK: tl.constexpr, USE_FP8: tl.constexpr, out_scale,
++    FP8_MIN: tl.constexpr, FP8_MAX: tl.constexpr, c: tl.constexpr,
++):
++    out_c = acc_c * Li
++    if USE_FP8:
++        out_c = out_c * tl.load(out_scale)
++        out_c = tl.clamp(out_c, FP8_MIN, FP8_MAX)
++    dch = c * HEAD_CHUNK + tl.arange(0, HEAD_CHUNK)
++    o_off = (
++        query_offset_0[:, None] * output_stride_0
++        + query_offset_1[:, None] * output_stride_1
++        + dch[None, :]
++    )
++    tl.store(
++        output_ptr + o_off,
++        out_c,
++        mask=(dch < HEAD_SIZE)[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
++    )
++
++
++@triton.jit
++def kernel_unified_attention_2d_headchunk(
++    output_ptr,  # [num_tokens, num_query_heads, head_size]
++    query_ptr,  # [num_tokens, num_query_heads, head_size]
++    key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
++    value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
++    sink_ptr,  # [num_query_heads]
++    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
++    seq_lens_ptr,  # [num_seqs]
++    alibi_slopes_ptr,  # [num_query_heads]
++    qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
++    scale,  # float32
++    k_scale,  # float32
++    v_scale,  # float32
++    out_scale,  # float32
++    softcap,  # float32
++    num_query_heads: tl.constexpr,  # int
++    num_queries_per_kv: tl.constexpr,  # int
++    block_table_stride: tl.int64,  # int
++    query_stride_0: tl.int64,  # int
++    query_stride_1: tl.int64,  # int, should be equal to head_size
++    output_stride_0: tl.int64,  # int
++    output_stride_1: tl.int64,  # int, should be equal to head_size
++    qq_bias_stride_0: tl.int64,  # int
++    BLOCK_SIZE: tl.constexpr,  # int
++    TILE_SIZE: tl.constexpr,  # int must be power of 2
++    HEAD_SIZE: tl.constexpr,  # int
++    HEAD_SIZE_PADDED: tl.constexpr,  # int, must be power of 2
++    USE_ALIBI_SLOPES: tl.constexpr,  # bool (dispatch guarantees False here)
++    USE_ALIBI_SQRT: tl.constexpr,  # bool
++    USE_QQ_BIAS: tl.constexpr,  # bool (dispatch guarantees False here)
++    USE_SOFTCAP: tl.constexpr,  # bool
++    USE_SINKS: tl.constexpr,  # bool (dispatch guarantees False here)
++    SLIDING_WINDOW: tl.constexpr,  # int (0 for head-512 full-attn)
++    USE_MM_PREFIX: tl.constexpr,  # bool
++    MAX_MM_RANGES: tl.constexpr,  # int
++    mm_prefix_range_ptr,  # [num_seqs]
++    stride_k_cache_0: tl.int64,  # int
++    stride_k_cache_1: tl.int64,  # int
++    stride_k_cache_2: tl.int64,  # int
++    stride_k_cache_3: tl.constexpr,  # int
++    stride_v_cache_0: tl.int64,  # int
++    stride_v_cache_1: tl.int64,  # int
++    stride_v_cache_2: tl.int64,  # int
++    stride_v_cache_3: tl.constexpr,  # int
++    query_start_len_ptr,  # [num_seqs+1]
++    BLOCK_Q: tl.constexpr,  # int
++    num_seqs: tl.int32,
++    BLOCK_M: tl.constexpr,  # int
++    USE_FP8: tl.constexpr,  # bool
++    HEAD_CHUNK: tl.constexpr,  # head-chunk width (e.g. 64); NUM=HEAD_SIZE_PADDED//HEAD_CHUNK must be 8
++    FP8_MIN: tl.constexpr = float8_info.min,
++    FP8_MAX: tl.constexpr = float8_info.max,
++):
++    # Head-512 flash-prefill: chunks QK + PV in HEAD_CHUNK-wide head slices so the full 512-deep K/V
++    # is never staged (LDS-occupancy lever, RDNA4). Dispatch gates this to head_size==512 with
++    # USE_ALIBI/USE_SINKS/USE_QQ_BIAS all False, so those paths are omitted. NUM (=8) accumulators are
++    # an explicit tuple (the only Triton-3.6 construct that carries N per-chunk accs across the KV loop).
++    q_block_global_idx = tl.program_id(0)
++    kv_head_idx = tl.program_id(1)
++
++    seq_idx = find_seq_idx(
++        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
++    )
++    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
++    q_block_local_idx = q_block_global_idx - q_block_start_idx
++    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
++    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
++    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
++
++    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
++        return
++
++    offs_m = tl.arange(0, BLOCK_M)
++    offs_t = tl.arange(0, TILE_SIZE)
++    dc = tl.arange(0, HEAD_CHUNK)
++    NUM: tl.constexpr = HEAD_SIZE_PADDED // HEAD_CHUNK
++    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
++
++    query_offset_0 = cur_batch_in_all_start_index + query_pos
++    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
++
++    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
++    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
++
++    QDT = query_ptr.dtype.element_ty
++    block_table_offset = seq_idx * block_table_stride
++
++    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
++    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
++    accs = (
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++        tl.zeros([BLOCK_M, HEAD_CHUNK], dtype=tl.float32),
++    )
++
++    seq_len = tl.load(seq_lens_ptr + seq_idx)
++    context_len = seq_len - cur_batch_query_len
++
++    max_seq_prefix_len = (
++        context_len
++        + q_block_local_idx * BLOCK_Q
++        + (BLOCK_M - 1) // num_queries_per_kv
++        + 1
++    )
++    if USE_MM_PREFIX:
++        max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
++    else:
++        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
++
++    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
++
++    tile_start = 0
++    tile_end = num_tiles
++    if SLIDING_WINDOW > 0 and not USE_MM_PREFIX:
++        qpos_lo = q_block_local_idx * BLOCK_Q
++        qpos_hi = tl.minimum(
++            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
++            cur_batch_query_len - 1,
++        )
++        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
++        last_allowed_key = context_len + qpos_hi
++        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
++        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
++
++    for j in range(tile_start, tile_end):
++        seq_offset = j * TILE_SIZE + offs_t
++        tile_mask = seq_offset < max_seq_prefix_len
++
++        physical_block_idx = tl.load(
++            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
++        ).to(tl.int64)
++
++        # QK: accumulate S over HEAD_CHUNK-wide head slices; only a [HEAD_CHUNK, TILE] K-chunk staged.
++        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
++        for c in range(NUM):
++            dch = c * HEAD_CHUNK + dc
++            q_off = (
++                query_offset_0[:, None] * query_stride_0
++                + query_offset_1[:, None] * query_stride_1
++                + dch[None, :]
++            )
++            Qc = tl.load(
++                query_ptr + q_off,
++                mask=(dch < HEAD_SIZE)[None, :]
++                & query_mask_0[:, None]
++                & query_mask_1[:, None],
++                other=0.0,
++            )
++            k_off = (
++                physical_block_idx[None, :] * stride_k_cache_0
++                + kv_head_idx * stride_k_cache_2
++                + dch[:, None] * stride_k_cache_3
++                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
++            )
++            Kc_load = tl.load(
++                key_cache_ptr + k_off,
++                mask=(dch < HEAD_SIZE)[:, None] & tile_mask[None, :],
++                other=0.0,
++            )
++            if Kc_load.dtype.is_fp8():
++                if Qc.dtype.is_fp8():
++                    # All-fp8 path: mirror the stock 2D kernel exactly — raw fp8xfp8 dot, k_scale
++                    # NOT applied per-tile (it is folded into out_scale). Only the Q-not-fp8 path
++                    # (prod: bf16 Q + fp8 KV cache) dequants K here.
++                    Kc = Kc_load
++                else:
++                    Kc = (Kc_load.to(tl.float32) * tl.load(k_scale)).to(QDT)
++            else:
++                Kc = Kc_load
++            S += tl.dot(Qc, Kc)
++        S = S * scale
++
++        if USE_SOFTCAP:
++            S = apply_softcap(S, softcap)
++
++        query_abs_pos = context_len + query_pos[:, None]
++        seq_mask = seq_offset[None, :] <= query_abs_pos
++        if SLIDING_WINDOW > 0:
++            seq_mask = seq_mask & ((query_abs_pos - seq_offset) < SLIDING_WINDOW)
++        if USE_MM_PREFIX:
++            for i in range(MAX_MM_RANGES):
++                range_start = tl.load(
++                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2
++                )
++                range_end = tl.load(
++                    mm_prefix_range_ptr + seq_idx * MAX_MM_RANGES * 2 + i * 2 + 1
++                )
++                is_valid = range_start < range_end
++                q_in_range = (
++                    (query_abs_pos >= range_start)
++                    & (query_abs_pos <= range_end)
++                    & is_valid
++                )
++                k_in_range = (
++                    (seq_offset[None, :] >= range_start)
++                    & (seq_offset[None, :] <= range_end)
++                    & is_valid
++                )
++                seq_mask |= q_in_range & k_in_range
++
++        S = tl.where(
++            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
++        )
++
++        m_j = tl.maximum(M, tl.max(S, axis=1))
++        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
++        P = tl.exp(S - m_j[:, None])
++        l_j = tl.sum(P, axis=1)
++        alpha = tl.exp(M - m_j)
++        L = L * alpha + l_j
++        M = m_j
++        P_cast = P.to(QDT)
++
++        # PV: explicit NUM-tuple update; each _pv_chunk stages only a [TILE, HEAD_CHUNK] V-chunk.
++        accs = (
++            _pv_chunk(accs[0], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 0),
++            _pv_chunk(accs[1], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 1),
++            _pv_chunk(accs[2], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 2),
++            _pv_chunk(accs[3], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 3),
++            _pv_chunk(accs[4], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 4),
++            _pv_chunk(accs[5], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 5),
++            _pv_chunk(accs[6], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 6),
++            _pv_chunk(accs[7], alpha, P_cast, value_cache_ptr, physical_block_idx, kv_head_idx, seq_offset, tile_mask, stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3, BLOCK_SIZE, HEAD_SIZE, HEAD_CHUNK, v_scale, QDT, 7),
++        )
++
++    # epilogue: per output-head chunk normalize + optional fp8 out-scale + store to its head offset.
++    Li = (1.0 / L)[:, None]
++    _store_chunk(output_ptr, accs[0], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 0)
++    _store_chunk(output_ptr, accs[1], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 1)
++    _store_chunk(output_ptr, accs[2], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 2)
++    _store_chunk(output_ptr, accs[3], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 3)
++    _store_chunk(output_ptr, accs[4], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 4)
++    _store_chunk(output_ptr, accs[5], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 5)
++    _store_chunk(output_ptr, accs[6], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 6)
++    _store_chunk(output_ptr, accs[7], Li, query_offset_0, query_offset_1, output_stride_0, output_stride_1, query_mask_0, query_mask_1, HEAD_SIZE, HEAD_CHUNK, USE_FP8, out_scale, FP8_MIN, FP8_MAX, 7)
++
++
++@triton.jit
+ def kernel_unified_attention_3d(
+     segm_output_ptr,
+     # [num_tokens, num_query_heads, num_segments, head_size_padded]
+@@ -1038,6 +1348,20 @@
+         )
+     else:
+         _use_2d = max_seqlen_q > 1 or num_seqs > seq_threshold_3D
++    # Head-512 flash-prefill rewrite (VLLM_FA_HEADCHUNK): route the head-512 (Gemma full-attn) 2D path
++    # to the chunked kernel, which never stages the full 512-deep K/V -> low LDS -> high occupancy on
++    # RDNA4. Gated to head_size==512 with NO alibi/qq_bias/sinks (always true for Gemma full-attn) and
++    # NUM==8 (the kernel hardcodes 8 per-chunk accumulators). Anything else falls to the stock monolithic.
++    _hs_padded = triton.next_power_of_2(head_size)
++    use_headchunk = (
++        _FA_HEADCHUNK > 0
++        and head_size == 512
++        and not use_alibi_slopes
++        and not use_qq_bias
++        and sinks is None
++        and _hs_padded % _FA_HEADCHUNK == 0
++        and (_hs_padded // _FA_HEADCHUNK) == 8
++    )
+     if (
+         seq_threshold_3D is None
+         or num_par_softmax_segments is None
+@@ -1047,7 +1371,13 @@
+         or _use_2d
+         or is_batch_invariant
+     ):
+-        kernel_unified_attention_2d[
++        _kern_2d = (
++            kernel_unified_attention_2d_headchunk
++            if use_headchunk
++            else kernel_unified_attention_2d
++        )
++        _extra_2d = {"HEAD_CHUNK": _FA_HEADCHUNK} if use_headchunk else {}
++        _kern_2d[
+             (
+                 total_num_q_blocks,
+                 num_kv_heads,
+@@ -1101,6 +1431,7 @@
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             USE_FP8=output_scale is not None,
++            **_extra_2d,
+         )
+     else:
+         # Genuine large-query prefill (only reachable when the segm buffers were grown
