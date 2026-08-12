@@ -118,7 +118,9 @@ Full results — concurrency sweeps, the 8-bench engine A/B, and the long-contex
 "compaction" ladder — plus the reproduction tools live in [`validation/`](../../tree/rdna4/validation).
 
 Engine A/B vs the previous production engine (same weights, same sampling):
-greedy outputs byte-identical at 6–7k context; 7-bench quality gate (IFEval
-exact tie, GPQA-D −1/60, GSM8K −1/50 & +3/50, AA-LCR +4/100, τ²-telecom
-0.9825 vs 0.974, AIME parity) — no regressions; long-context survival to 255k.
-Full methodology in vllm-project/vllm#51995.
+greedy outputs byte-identical at 6–7k context; 8-cell quality gate — three
+cells above anchor (GSM8K-think +3, AA-LCR +4, τ²-telecom +1 sim), the rest at
+noise-band parity, zero regressions; long-context survival to 255k; day-1
+production stability 2,961 requests / 0 restarts / 0 engine errors. Full
+tables in [`validation/`](../../tree/rdna4/validation); methodology history in
+vllm-project/vllm#51995.

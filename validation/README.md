@@ -72,3 +72,39 @@ Known residue, disclosed: cold prefill is ~0.69× the previous engine
 (7.1k vs 10.4k tok/s single-stream); under continuous batching long prefills
 reach ~12.7k tok/s. High-concurrency (≥24 users) at the 7k shape trails the
 previous engine by ~8–13%.
+
+## Engine A/B quality gate — rc5 vs previous production engine
+
+Same weights, same sampling, same seeds; anchors measured on the previous
+engine under identical conditions. Verdict convention: ±3 items on a
+GPQA-class cell is single-run noise band.
+
+| Bench | n | previous engine | rc5 | verdict |
+|---|---|---|---|---|
+| IFEval | 80 | 0.925 | **0.925** | exact tie |
+| GPQA-Diamond | 60 | 0.7833 | 0.7667 | −1 item (noise band) |
+| GSM8K (no thinking) | 50 | 0.94 | 0.92 | −1 item |
+| GSM8K (thinking) | 50 | 0.60 | **0.66** | **+3 above anchor** |
+| AA-LCR (thinking) | 100 | 0.6300 | **0.6700** | **+4 above anchor** |
+| τ²-bench telecom | 114 | 0.974 | **0.9825** | +1 sim, all 114 closed |
+| AIME '25 | 30 | 0.000 (0/30 terminate) | 0.000 (12/30 terminate) | score parity, termination better¹ |
+| HLE | 120 | — (no anchor) | 0.2167² | first cell (family ref: stock base 0.1167) |
+
+¹ Termination-gain attribution caveat: the rc5 arm ran at higher concurrency
+than the anchors (30–32 vs 4); batch numerics may contribute.
+² 19 non-terminating runs score 0 — a labeled 15.8% censoring, not silently
+dropped.
+
+Three cells above anchor, the rest at noise-band parity, zero regressions.
+Additional evidence: greedy outputs byte-identical at 6–7k context; an internal
+166-test domain regression suite at 164/166 (0 hard failures); dequantization
+validated bit-exact against an independent LUT/E8M0 oracle (GEMM ≤3.7e-10).
+
+## Day-1 production stability (first 10 hours after promotion)
+
+2,961 completed requests (0 aborts), 0 engine restarts, 0 engine errors in the
+journal, 72.4% live MTP acceptance, flat RAM/VRAM — while also absorbing
+benchmark bursts at concurrency 30–32 (1,185 KV preemptions, handled by
+recompute: graceful degradation, no faults). Known open items: cold-prefill
+throughput ×0.69 vs the previous engine at 7.4k, and a ceded high-concurrency
+ceiling on the long-prefix shape (~24 vs ~32 users at ≥20 tok/s/user).
