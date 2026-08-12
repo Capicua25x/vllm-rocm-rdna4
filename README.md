@@ -1,5 +1,8 @@
 # vLLM on AMD RDNA4 (gfx1201) — R9700 · RX 9070 XT
 
+> ## 🙏 Built on Rob Smith's RDNA4 work
+> Everything here stands on the gfx1201 kernel enablement that **[Rob Smith](https://hub.docker.com/r/tcclaviger/vllm-rocm-mxfp4-nvfp4)** pioneered — the original MXFP4/NVFP4 + MoE kernel work for RDNA4 (his `tcclaviger/vllm-rocm-mxfp4-nvfp4` images, vLLM 0.18.x era). This repo forward-ports and extends that foundation. **Without Rob's work, none of this exists.** See `NOTICE` for the derivation chain.
+
 This fork carries production-validated improvements for running vLLM on
 **RDNA4** GPUs (Radeon AI PRO R9700, Radeon RX 9070 XT — `gfx1201`), maintained
 as rebased branches rather than upstream PRs (fork-carry model): use them, fold
