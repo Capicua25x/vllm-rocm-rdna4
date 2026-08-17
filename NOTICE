@@ -1,0 +1,52 @@
+vllm-rocm-rdna4 (branch rdna4-port-0.26.1)
+Copyright 2026 Capicua25x
+
+This product is a derivative work of vLLM (https://github.com/vllm-project/vllm),
+licensed under the Apache License, Version 2.0. A copy of that license is in the
+LICENSE file. Modified files carry notices of the changes; the branch history
+(fork-carry model: feat/rdna4-mxfp4-linear, fix/unified-attn-3d-smallq, and the
+rdna4-port-0.26.1 integration branch) is the record of what changed.
+
+Lineage of the RDNA4 (gfx1201) enablement
+-----------------------------------------
+The gfx1201 kernel enablement this port descends from was first cracked by
+Rob Smith (`tcclaviger`) for the vLLM 0.18.1 line and distributed as the image
+`tcclaviger/vllm-rocm-mxfp4-nvfp4`: the working RDNA4 base (gfx1201 hipBLASLt
+plus MXFP4/NVFP4 MoE kernels). That work was published as source at the time and
+forward-ported by this project to vLLM 0.19.1 in
+`Capicua25x/vllm-rocm-rdna4-legacy` (archived), and from there to the 0.26.1
+branch carried here. As of 2026-08-16 his source is no longer publicly available
+(his current RDNA4 work ships as the image `tcclaviger/vllm` with weights on
+Hugging Face); Apache-2.0 does not require source distribution, and the grants
+under which the earlier source was received are unaffected. This notice exists so
+the lineage remains on the record.
+
+Separately, `vllm/model_executor/kernels/linear/mxfp4/rdna_fp8.py` takes its
+design lineage from Rob's `_matmul_fp8_ogs` (0.24 line, W8A8): the same
+per-K-group scale fold on WMMA v2. The MXFP4 nibble→e4m3 unpack, the three-regime
+dispatch (fused decode / weight-only mid-M / dequant+hipBLASLt prefill) and the
+integration are this project's work.
+
+Original in this port (not derived from the above)
+--------------------------------------------------
+  * RdnaMxfp4LinearKernel / RdnaMxfp4Fp8LinearKernel as carried here for 0.26.1,
+    including the FP8-WMMA decode path (rc6).
+  * The speculative-decode verify fix: 3D split-KV path for small-q shapes
+    (MAX_QLEN_3D) in the Triton unified attention kernel.
+  * The fp8-KV attention overlay for ROCm (enabling fp8 query input so K/V are not
+    dequantized inside the KV loop; kernel-dev/overlay/triton_attn.py).
+  * A clean-room Triton head-dim-512 flash-prefill chunking implementation whose
+    blueprint comes from llama.cpp (MIT); no llama.cpp code was copied.
+  * Model bring-up, serving recipes, and the A/B validation campaigns.
+
+Other components used or referenced (not modified, not redistributed here)
+--------------------------------------------------------------------------
+  * Triton / triton_kernels — MIT.
+  * AMD ROCm (hipBLASLt, rocBLAS, RCCL, HIP) — MIT.
+  * PyTorch — BSD-3-Clause (inherited via the base image).
+  * HuggingFace Transformers — Apache-2.0 (inherited via the base image).
+  * AMD Quark / compressed-tensors quantization formats — the port consumes these
+    checkpoint formats; it does not redistribute them.
+
+No model weights are included. Weights are bind-mounted at runtime from the user's
+own Hugging Face cache; confirm the license on the specific model card you deploy.

@@ -3,6 +3,26 @@
 Branch `rdna4-port-0.26.1` = upstream vLLM 0.26.1 + the changes needed to serve well on AMD
 RDNA4 consumer/workstation GPUs, which are outside the official ROCm vLLM targets (gfx90a/942/950).
 
+## Attribution and lineage
+
+The gfx1201 enablement this port descends from was first done by **Rob Smith (`tcclaviger`)** for the
+vLLM **0.18.1** line and shipped as `tcclaviger/vllm-rocm-mxfp4-nvfp4` — the working RDNA4 base
+(gfx1201 hipBLASLt + MXFP4/NVFP4 MoE kernels). Chain: his 0.18.1 work → forward-port to **0.19.1** in
+`Capicua25x/vllm-rocm-rdna4-legacy` (archived) → this **0.26.1** branch. Separately, `rdna_fp8.py`
+takes its design lineage from his `_matmul_fp8_ogs` (0.24 line, W8A8): the same per-K-group scale fold
+on WMMA v2.
+
+His source is **no longer publicly available** (as of 2026-08-16 his RDNA4 work ships as the
+`tcclaviger/vllm` image, weights on Hugging Face). Apache-2.0 does not require source distribution and
+the grants under which the earlier source was received are unaffected — this note exists so the record
+survives, not as a complaint.
+
+What is **this project's** work, for the avoidance of doubt: the MXFP4 nibble→e4m3 unpack and the
+three-regime dispatch in `rdna_fp8.py`; the spec-decode verify fix (`MAX_QLEN_3D`); the ROCm fp8-KV
+attention overlay (fp8 query input, so K/V are not dequantized inside the KV loop); the clean-room
+head-dim-512 flash-prefill kernel (blueprint from llama.cpp, MIT, no code copied); model bring-up,
+serving recipes and the validation campaigns. See `NOTICE`.
+
 ## What's in the port
 - `vllm/model_executor/kernels/linear/mxfp4/rdna.py` — `RdnaMxfp4LinearKernel`: weight-only (A16)
   MXFP4 dense linear for RDNA4 (no hardware MX datapath): in-kernel Triton dequant of 4-bit tiles
