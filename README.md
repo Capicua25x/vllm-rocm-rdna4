@@ -1,7 +1,9 @@
 # vLLM on AMD RDNA4 (gfx1201) — R9700 · RX 9070 XT
 
-> ## 🙏 Built on Rob Smith's RDNA4 work
-> Everything here stands on the gfx1201 kernel enablement that **[Rob Smith](https://hub.docker.com/r/tcclaviger/vllm-rocm-mxfp4-nvfp4)** pioneered — the original MXFP4/NVFP4 + MoE kernel work for RDNA4 (his `tcclaviger/vllm-rocm-mxfp4-nvfp4` images, vLLM 0.18.x era). This repo forward-ports and extends that foundation. **Without Rob's work, none of this exists.** See `NOTICE` for the derivation chain.
+> ## Lineage and attribution
+> The gfx1201 enablement this fork descends from was first done by **[Rob Smith](https://hub.docker.com/r/tcclaviger/vllm-rocm-mxfp4-nvfp4)** (`tcclaviger`) for the vLLM **0.18.1** line — the working RDNA4 base (gfx1201 hipBLASLt + MXFP4/NVFP4 MoE kernels), shipped as `tcclaviger/vllm-rocm-mxfp4-nvfp4`. Chain: his 0.18.1 work → forward-port to **0.19.1** in [`vllm-rocm-rdna4-legacy`](https://github.com/Capicua25x/vllm-rocm-rdna4-legacy) (archived) → this **0.26.1** branch. Separately, the FP8-WMMA MXFP4 kernel (`rdna_fp8.py`) takes its design lineage from his `_matmul_fp8_ogs` (0.24 line, W8A8).
+>
+> His source is no longer publicly available (his current RDNA4 work ships as the `tcclaviger/vllm` image, weights on Hugging Face). Apache-2.0 does not require source distribution and the grants under which the earlier source was received are unaffected — this note is here so the record survives, not as a complaint. What is original to this fork is delimited in [`NOTICE`](NOTICE).
 
 This fork carries production-validated improvements for running vLLM on
 **RDNA4** GPUs (Radeon AI PRO R9700, Radeon RX 9070 XT — `gfx1201`), maintained
@@ -34,10 +36,10 @@ R9700; a single 32 GB card fits the smaller quants at reduced context.
 
 | model | quant | status |
 |---|---|---|
-| **Qwen3.5/3.6-35B-A3B family** (incl. hybrid GDN + MTP head) | MXFP4 (native kernel) | ✅ **in production TODAY serving [Ornith-1.0-35B](https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B)** behind a real business assistant — 111 tok/s @7k ctx w/ MTP, 262k context |
-| **Muse Glimmer 30B** (multimodal) | FP8 | ✅ validated — serving, tool-calling (`muse_glimmer` parsers), agentic use; DFlash drafter integration in validation |
-| **Gemma 4 26B-A4B-it** | NVFP4 (native RDNA4 MoE patches) | ✅ validated — MTP assistant backport, 256k context; full recipe in [`gemma-nvfp4/`](../../tree/rdna4/gemma-nvfp4) |
-| **Qwen 3.8-27B** | FP8 planned | 🎯 targeted — image gates will extend the day weights ship |
+| **Qwen3.5/3.6-35B-A3B family** (incl. hybrid GDN + MTP head) | MXFP4 (native kernel) | **in production TODAY serving [Ornith-1.0-35B](https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B)** behind a real business assistant — 111 tok/s @7k ctx w/ MTP, 262k context |
+| **Muse Glimmer 30B** (multimodal) | FP8 | validated — serving, tool-calling (`muse_glimmer` parsers), agentic use; DFlash drafter integration in validation |
+| **Gemma 4 26B-A4B-it** | NVFP4 (native RDNA4 MoE patches) | validated — MTP assistant backport, 256k context; full recipe in [`gemma-nvfp4/`](../../tree/rdna4/gemma-nvfp4) |
+| **Qwen 3.8-27B** (dense hybrid GDN/attn, VL, native MTP) | FP8 (stock) · **MXFP4** (ours, FP8-WMMA kernel) | validated — 262k window, ~61 tok/s MXFP4 / ~63 FP8, MTP-3; paired against a bf16 reference (campaign in progress) |
 
 Anything upstream vLLM runs on ROCm also works here unchanged; the value of
 this fork is the native MXFP4 path and the spec-decode fixes on top.
