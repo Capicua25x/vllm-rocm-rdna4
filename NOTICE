@@ -27,12 +27,25 @@ integration are this project's work.
 
 Original in this port (not derived from the above)
 --------------------------------------------------
-  * RdnaMxfp4LinearKernel / RdnaMxfp4Fp8LinearKernel as carried here for 0.26.1,
-    including the FP8-WMMA decode path (rc6).
-  * The speculative-decode verify fix: 3D split-KV path for small-q shapes
-    (MAX_QLEN_3D) in the Triton unified attention kernel.
+  * RdnaMxfp4Fp8LinearKernel -- the FP8-WMMA decode path (rc6), whose scale-fold
+    design follows Rob's `_matmul_fp8_ogs` as noted above.
+  * A gate relaxation on upstream's 3D split-KV path so small-q spec-decode verify
+    shapes can use it (MAX_QLEN_3D, token-count capacity check) -- 11 lines on a
+    kernel by Burkhard Ringlein, Jan van Lunteren, Chih-Chieh Yang and Thomas
+    Parnell. Arrived at independently; equivalent relaxations were proposed upstream
+    first in vllm-project/vllm #44652, #45450 and #46724, none merged as of 2026-08.
   * The RDNA4 gating in mxfp4_utils.py and compressed_tensors_moe_w4a4_mxfp4.py.
   * Model bring-up, serving recipes, and the A/B validation campaigns.
+
+Forward-ported, not original -- derived from the lineage above:
+  * RdnaMxfp4LinearKernel (weight-only MXFP4), the RDNA4 branch in _swizzle_mxfp4,
+    and the MXFP4 MoE routing: forward-ported from this project's 0.19.1 patch set,
+    itself derived from Rob Smith's tcclaviger/vllm-rocm-mxfp4-nvfp4 RDNA4 work.
+  * The RDNA4 triton_kernels graft the MXFP4 path depends on (RDNAMXValueLayout /
+    mxfp4_dequant_rdna, and the RDNA branches in _matmul_ogs.py, opt_flags.py,
+    target_info.py): same lineage. It is NOT in upstream triton_kernels. This
+    source repository does not carry it, but the published Docker image does --
+    see below.
 
 Original to this project but carried OUTSIDE this branch, and so not part of the
 source in this repository:
@@ -46,7 +59,10 @@ Other components used or referenced (not modified, not redistributed in this
 source repository - the published Docker image does bundle them, under their
 own licenses)
 --------------------------------------------------------------------------
-  * Triton / triton_kernels — MIT.
+  * Triton -- MIT.
+  * triton_kernels -- MIT. The published Docker image carries a MODIFIED copy: five
+    files are replaced at build time to add the RDNA4 paths described above. Those
+    modifications are forward-ported from Rob Smith's RDNA4 work, not upstream.
   * AMD ROCm (hipBLASLt, rocBLAS, RCCL, HIP) — MIT.
   * PyTorch — BSD-3-Clause (inherited via the base image).
   * HuggingFace Transformers — Apache-2.0 (inherited via the base image).

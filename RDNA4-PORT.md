@@ -19,10 +19,19 @@ His RDNA4 work is distributed as Docker images under `tcclaviger`.
 What is **this project's** own work, scoped to what is actually in this branch:
 
 * the MXFP4 nibble→e4m3 unpack and the three-regime dispatch in `rdna_fp8.py`;
-* the spec-decode verify fix (`MAX_QLEN_3D`) in `triton_unified_attention.py`;
+* a **gate relaxation** on upstream's 3D split-KV path so small-q spec-decode verify shapes can use it
+  (`MAX_QLEN_3D`) — 11 lines on a kernel by Burkhard Ringlein, Jan van Lunteren, Chih-Chieh Yang and
+  Thomas Parnell. Arrived at independently, but equivalent relaxations were proposed upstream **first**
+  (vllm-project/vllm #44652, #45450, #46724 — none merged as of 2026-08);
 * the RDNA4 gating in `mxfp4_utils.py` and `compressed_tensors_moe_w4a4_mxfp4.py`;
-* the weight-only `RdnaMxfp4LinearKernel`;
 * model bring-up, the quantization recipes below, and the validation campaigns.
+
+**Forward-ported rather than original**, and derived from the lineage above: the weight-only
+`RdnaMxfp4LinearKernel`, the RDNA4 branch in `_swizzle_mxfp4`, the MXFP4 MoE routing, and — the largest
+borrowed piece — the RDNA4 `triton_kernels` graft the whole MXFP4 path depends on (`RDNAMXValueLayout` /
+`mxfp4_dequant_rdna`, plus the RDNA branches in `_matmul_ogs.py`, `opt_flags.py`, `target_info.py`). That
+graft is **not** in upstream `triton_kernels`; it is not carried in this source repository, but the
+published image ships it. See `NOTICE`.
 
 Carried **outside this branch**, and so not claimed as part of it: the ROCm fp8-KV attention overlay
 (applied at container build time) and the clean-room head-dim-512 flash-prefill kernel (blueprint
@@ -57,6 +66,12 @@ export `weight_format=real_quantized`, `pack_method=reorder`, `quant_mode=eager_
 All builds are **data-free** (`algo_config=null`, `QUARK_ALGO=none` — RTN-style, *not* AWQ) and run on
 **CPU**, so the GPUs stay free for benchmarking. Packing is genuine 4-bit: a bf16 `[out, in]` weight
 becomes a U8 `[out, in/2]` plus a U8 `weight_scale` `[out, in/32]`.
+
+**Prerequisite: `ninja` on `PATH`.** Importing `quark.torch` JIT-builds a C++ hw-emulation extension, so
+without ninja the *import itself* dies — `RuntimeError: Ninja is required to load C++ extensions` — before
+any driver code runs. `pip install ninja` drops the binary in the venv's `bin/`, which is **not** on `PATH`
+when the interpreter is invoked by absolute path. Export it:
+`PATH=<venv>/bin:$PATH <venv>/bin/python driver.py`.
 
 ### The policy
 
@@ -95,6 +110,52 @@ Two consequences worth stating plainly, because both are easy to misread:
 Note that `direct_quantize_checkpoint` reads `config.json` off the filesystem — it does not resolve HF
 repo ids. Snapshot first, hand it the local directory.
 
+Minimal complete driver for the file-to-file path (this is the whole config construction — the
+`LLMTemplate` step is not optional: Quark's built-in template list does not cover `qwen3_5`, and
+`LLMTemplate.get()` raises for an unregistered model type):
+
+```python
+import transformers
+from quark.torch import LLMTemplate, ModelQuantizer
+
+SRC = "<local snapshot dir>"   # a directory — direct_quantize_checkpoint does not resolve repo ids
+OUT = "<output dir>"
+
+EXCLUDE = [                    # Qwen3.8-27B, 15 globs — see "Per-family exclude lists" below
+    "lm_head", "*embed_tokens*",
+    "*.self_attn.q_proj", "*.self_attn.k_proj", "*.self_attn.v_proj", "*.self_attn.o_proj",
+    "*.self_attn.q_norm", "*.self_attn.k_norm",
+    "*norm*",
+    "*.linear_attn.conv1d", "*.linear_attn.norm",
+    "*.mlp.gate",
+    "mtp*",
+    "*visual*", "*vision*",
+]
+
+model_type = transformers.AutoConfig.from_pretrained(SRC, trust_remote_code=True).model_type
+
+if model_type not in LLMTemplate.list_available():
+    LLMTemplate.register_template(LLMTemplate(
+        model_type=model_type,
+        kv_layers_name=["*language_model.*k_proj", "*language_model.*v_proj"],
+        q_layer_name="*language_model.*q_proj",
+        exclude_layers_name=EXCLUDE,
+    ))
+
+# No `algorithm=` kwarg -> `algo_config` stays null -> data-free, CPU-only.
+# Pass `algorithm="awq"` instead for the activation-aware variant (needs a GPU and forward passes).
+quant_config = LLMTemplate.get(model_type).get_config(scheme="mxfp4", exclude_layers=EXCLUDE)
+
+ModelQuantizer(quant_config).direct_quantize_checkpoint(
+    pretrained_model_path=SRC, save_path=OUT, device="cpu")
+```
+
+`get_config` logs `Expanding exclude pattern [X] to [X, X.*]` for every glob that could name a parent
+module, so the 15 globs become 30 entries on the config object. That is Quark being thorough, not a
+misparse. For the stacked-3D-expert models substitute the second build path
+(`preprocess_for_quantization` → `quantize_model` → `freeze` → `export_safetensors`) for the
+`direct_quantize_checkpoint` call; everything above it is unchanged.
+
 ### Per-family exclude lists
 
 **None of these transfer between families.** They are derived per model from that repo's
@@ -102,12 +163,17 @@ repo ids. Snapshot first, hand it the local directory.
 driver input; the number in brackets is how many concrete module names Quark recorded in the artifact's
 `quantization_config.exclude` (only quantizable Linear/Conv modules are recorded, so `*norm*` and
 `*embed_tokens*` frequently contribute **zero** recorded entries — do not read their absence as the
-pattern not having applied).
+pattern not having applied). Patterns are matched with `fnmatch.fnmatch` — in
+`file2file_quantization.py` for the file-to-file path and in `model_transformation.py` for the in-memory
+one — so **brace expansion is not available**: `*.self_attn.{q,k,v,o}_proj` matches nothing at all
+(fnmatch escapes the braces into a literal), and the modules it was meant to protect get quantized
+silently. Enumerate alternatives literally.
 
 *Qwen3.8-27B* — `qwen3_5`, dense hybrid VL — 15 globs → **231** recorded:
 ```
 lm_head, *embed_tokens*
-*.self_attn.{q,k,v,o}_proj, *.self_attn.{q,k}_norm
+*.self_attn.q_proj, *.self_attn.k_proj, *.self_attn.v_proj, *.self_attn.o_proj
+*.self_attn.q_norm, *.self_attn.k_norm
 *norm*
 *.linear_attn.conv1d, *.linear_attn.norm
 *.mlp.gate                 # MoE router name — inert on this dense model, kept for symmetry
@@ -163,8 +229,14 @@ lm_head, *embed_tokens*, *embed_vision*
 * **Ornith-1.0-35B declares `mtp_num_hidden_layers: 1` but ships no `mtp.*` tensors** (verified against
   the Hub: 0 of 31,666), so a plain requant serves with no speculative decoding. Its head is a
   **cross-model graft**: 785 bf16 `mtp.*` tensors from a sibling Qwen3.6-35B-A3B MoE checkpoint with the
-  same hidden size and expert layout, added as one shard and named explicitly in `exclude`. Provenance
-  must be stated on any card that ships it — it is not an Ornith-trained head. MTP verification is
+  same hidden size and expert layout, added as one shard and named explicitly in `exclude`. The donor is
+  [`pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4`](https://huggingface.co/pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4)
+  (**Apache-2.0**), which quantizes the trunk but keeps `mtp.*` bf16; the head itself is
+  [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)'s own trained MTP block
+  (**Apache-2.0**), relaid from 2 stacked 3D expert tensors into 256x3 per-expert 2D weights — 19 - 2 +
+  768 = 785, and the 785 tensor names match the donor index exactly. These are third-party weights
+  carried verbatim, so the donor repo and its Apache-2.0 notice must be stated on any card that ships
+  it — it is not an Ornith-trained head. MTP verification is
   lossless by construction, so a mismatched head can only cost draft speed, never change outputs;
   **acceptance rate on this checkpoint is unmeasured.**
 * **Qwen3.8-27B is the opposite case and needs no graft:** it declares *and ships* its own MTP head
@@ -215,7 +287,7 @@ Artifacts are bind-mounted read-only into the serving container as `/quant/<name
 | Artifact | Base | Arch | Quantized modules | Size (from base) | `exclude` | Status |
 |---|---|---|---|---|---|---|
 | `Qwen3.8-27B-MXFP4-Quark-RDNA4` | `Qwen/Qwen3.8-27B` (Apache-2.0) | `qwen3_5`, **dense** hybrid VL, 64 layers = 48 GDN linear-attn + 16 full-attn | **432** = 192 dense MLP (64×3) + 240 linear-attn projections (48×5) | 22.3 GB (20.7 GiB) from 55.6 GB — 40.1 % | 231 | **served + benchmarked** |
-| `Ornith-1.0-35B-MXFP4-Quark-RDNA4` | `deepreinforce-ai/Ornith-1.0-35B` (MIT per card) + grafted MTP head | `qwen3_5_moe` VL, 40 layers = 30 GDN + 10 full-attn, 256 experts + 1 shared | **30,990** = 30,720 expert (40×256×3) + 120 shared-expert + 150 linear-attn | 23.0 GB (21.4 GiB) from 70.2 GB — 32.7 % | 1046 | structurally verified, **not yet loaded** |
+| `Ornith-1.0-35B-MXFP4-Quark-RDNA4` | `ornith-ai/Ornith-1.0-35B` (MIT per card; the old `deepreinforce-ai/Ornith-1.0-35B` id now redirects here) + MTP head grafted from `pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4` (Apache-2.0) | `qwen3_5_moe` VL, 40 layers = 30 GDN + 10 full-attn, 256 experts + 1 shared | **30,990** = 30,720 expert (40×256×3) + 120 shared-expert + 150 linear-attn | 23.0 GB (21.4 GiB) from 70.2 GB — 32.7 % | 1046 | structurally verified, **not yet loaded** |
 | `Muse-Glimmer-30B-MXFP4-Quark-RDNA4` | `meta-models/Muse-Glimmer-30B` (Apache-2.0 + usage policy) | `muse_glimmer`, dense VL, 52 layers, GQA-2, 39 sliding (window 2048) + 13 full | **156** = 52×3 MLP | 29.1 GB (27.1 GiB) | 564 | structurally verified, **not yet loaded** |
 | `Mistral-Small-3.2-24B-MXFP4-Quark-RDNA4` | `mistralai/Mistral-Small-3.2-24B-Instruct-2506` (Apache-2.0) | `mistral3`, dense, 40 layers + Pixtral-style 24-layer vision tower | **120** = 40×3 MLP | 18.5 GB (17.2 GiB) | 333 | structurally verified, **not yet loaded**; processor config missing (see quirks) |
 | `gemma-4-31B-it-MXFP4-Quark-RDNA4` | `google/gemma-4-31B-it` | `gemma4`, dense, 60 layers = 50 sliding + 10 full, 27-layer vision tower | **180** = 60×3 MLP | 32.0 GB (29.8 GiB) from 62.5 GB — 1.96× | 419 | structurally verified, **not yet loaded** |
@@ -260,7 +332,7 @@ Previous generation: `:0.19.1`.
 | Model | Format | Spec-decode | Notes |
 |---|---|---|---|
 | Qwen3.8-27B (dense hybrid GDN/attn, VL, native MTP) | FP8 (stock) / **MXFP4** (ours) | MTP-3 | MXFP4: 262k window, ~61 tok/s think-OFF (rc6; 51 on rc5) / ~46 think-ON; FP8: 64k, ~63 tok/s think-OFF. Both MXFP4 numbers are the RTN build; the Quark build now in production is in **Status** below. Recipe: **Quantization recipe** above |
-| Ornith-1.0-35B (`qwen3_5_moe` MoE) and a DSV4Pro-Thinking distill of Qwen3.6-35B-A3B | MXFP4 (compressed-tensors) | MTP-3 (grafted head) | ~75–107 tok/s single-stream; production engine 2026-06 → 2026-08-15. Ornith's own card describes the family as RL post-trained on Gemma 4 and Qwen 3.5 — its base lineage is **not established here**; the Quark rebuild is a separate, unserved artifact |
+| Ornith-1.0-35B (`qwen3_5_moe` MoE) and a DSV4Pro-Thinking distill of Qwen3.6-35B-A3B | MXFP4 (compressed-tensors) | MTP-3 (head grafted from `pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4`, Apache-2.0) | ~75–107 tok/s single-stream; production engine 2026-06 → 2026-08-15. Ornith's own card describes the family as RL post-trained on Gemma 4 and Qwen 3.5 — its base lineage is **not established here**; the Quark rebuild is a separate, unserved artifact |
 | Muse-Glimmer-30B | MXFP4 (RTN, retired pipeline) / FP8-block | DFlash draft (z-lab) | dense; the first model brought up on this line (hence the old tag name). The Quark MXFP4 rebuild is a separate, unserved artifact |
 | RadixArk Qwen3.8-27B-DSpark | bf16 draft | DSpark block-7 (V2 model runner) | works; loses to native MTP-3 on this hardware (44 vs 63 tok/s) |
 | amd/Qwen3.8-27B-Quark-AWQ-MXFP4 | Quark W4A4 | MTP-3 (with `mtp.*` exclude patch) | runs as W4A16 on the RDNA kernel. Paired single-card run (TP1, 32k, 8 slots, MTP-3, 2026-08-15) vs our **RTN** build: 26.8 vs 27.1 tok/s — a dead heat; gsm8k n=50 0.96 flex / **0.78 strict** vs 0.98 / 0.98. On this hardware quantizing attention costs strict-format adherence, not throughput |
