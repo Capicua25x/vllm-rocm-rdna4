@@ -5,23 +5,31 @@ RDNA4 consumer/workstation GPUs, which are outside the official ROCm vLLM target
 
 ## Attribution and lineage
 
-The gfx1201 enablement this port descends from was first done by **Rob Smith (`tcclaviger`)** for the
-vLLM **0.18.1** line and shipped as `tcclaviger/vllm-rocm-mxfp4-nvfp4` — the working RDNA4 base
-(gfx1201 hipBLASLt + MXFP4/NVFP4 MoE kernels). Chain: his 0.18.1 work → forward-port to **0.19.1** in
-`Capicua25x/vllm-rocm-rdna4-legacy` (archived) → this **0.26.1** branch. Separately, `rdna_fp8.py`
-takes its design lineage from his `_matmul_fp8_ogs` (0.24 line, W8A8): the same per-K-group scale fold
-on WMMA v2.
+**This port stands on Rob Smith's (`tcclaviger`) RDNA4 work, and without it none of this exists.**
+He did the gfx1201 enablement first, for the vLLM **0.18.1** line — the working RDNA4 base of
+gfx1201 hipBLASLt plus MXFP4/NVFP4 MoE kernels — and that is the foundation everything here is
+built on. Chain: his 0.18.1 work → forward-port to **0.19.1** in
+`Capicua25x/vllm-rocm-rdna4-legacy` (archived) → this **0.26.1** branch. Separately,
+`rdna_fp8.py` follows the design of his `_matmul_fp8_ogs` (0.24 line, W8A8): the same per-K-group
+scale fold on WMMA v2, applied to the fp32 accumulator after the dot. That credit is carried in the
+file itself, not only here.
 
-His source is **no longer publicly available** (as of 2026-08-16 his RDNA4 work ships as the
-`tcclaviger/vllm` image, weights on Hugging Face). Apache-2.0 does not require source distribution and
-the grants under which the earlier source was received are unaffected — this note exists so the record
-survives, not as a complaint.
+His RDNA4 work is distributed as Docker images under `tcclaviger`.
 
-What is **this project's** work, for the avoidance of doubt: the MXFP4 nibble→e4m3 unpack and the
-three-regime dispatch in `rdna_fp8.py`; the spec-decode verify fix (`MAX_QLEN_3D`); the ROCm fp8-KV
-attention overlay (fp8 query input, so K/V are not dequantized inside the KV loop); the clean-room
-head-dim-512 flash-prefill kernel (blueprint from llama.cpp, MIT, no code copied); model bring-up,
-serving recipes and the validation campaigns. See `NOTICE`.
+What is **this project's** own work, scoped to what is actually in this branch:
+
+* the MXFP4 nibble→e4m3 unpack and the three-regime dispatch in `rdna_fp8.py`;
+* the spec-decode verify fix (`MAX_QLEN_3D`) in `triton_unified_attention.py`;
+* the RDNA4 gating in `mxfp4_utils.py` and `compressed_tensors_moe_w4a4_mxfp4.py`;
+* the weight-only `RdnaMxfp4LinearKernel`;
+* model bring-up, the quantization recipes below, and the validation campaigns.
+
+Carried **outside this branch**, and so not claimed as part of it: the ROCm fp8-KV attention overlay
+(applied at container build time) and the clean-room head-dim-512 flash-prefill kernel (blueprint
+from llama.cpp, MIT, no code copied), which belongs to the 0.19.1 line.
+
+Four pre-existing upstream files are modified here; each carries a modification notice under its
+SPDX header, per Apache-2.0 §4(b). Everything else in the diff is newly added. See `NOTICE`.
 
 ## Quantization policy (2026-08-16)
 
@@ -36,6 +44,185 @@ datapath, so both formats are "unpack E2M1 into something the WMMA unit eats" �
 
 **Consumption is unrestricted**: the port loads what the ecosystem publishes (Quark, compressed-tensors, AWQ/GPTQ,
 vendor FP8). The policy above is about what this project *produces*.
+
+## Quantization recipe (Quark MXFP4)
+
+This section is the recipe of record for the MXFP4 checkpoints this project builds. The older
+`Capicua25x/qwen3.6-mxfp4-rdna4` repo documents the **retired RTN (`olka/qstream`) pipeline** and a
+different model; it is kept for history and is *not* the recipe for anything built after 2026-08-16.
+
+**Toolkit:** AMD Quark 0.12.post1 (`amd-quark==0.12.post1`, python 3.13, torch 2.10.0+rocm7.0).
+Scheme `mxfp4`: weights fp4, `per_group`, `group_size 32`, E8M0 scales, round half-even, static;
+export `weight_format=real_quantized`, `pack_method=reorder`, `quant_mode=eager_mode`.
+All builds are **data-free** (`algo_config=null`, `QUARK_ALGO=none` — RTN-style, *not* AWQ) and run on
+**CPU**, so the GPUs stay free for benchmarking. Packing is genuine 4-bit: a bf16 `[out, in]` weight
+becomes a U8 `[out, in/2]` plus a U8 `weight_scale` `[out, in/32]`.
+
+### The policy
+
+Only **MLP / MoE-expert projections** go to 4 bit. Attention (q/k/v/o and any per-head gate), every
+norm, embeddings, `lm_head`, MoE routers and shared-expert gates, `conv1d` in linear-attention layers,
+the whole vision path, and any MTP/draft head stay **bf16**.
+
+Two consequences worth stating plainly, because both are easy to misread:
+
+* **The checkpoints declare W4A4, not weight-only.** Quark's `mxfp4` scheme turns on dynamic fp4
+  activation quantization by default and we did not override it, so every build carries
+  `global_quant_config.input_tensors = {dtype: fp4, is_dynamic: true, per_group, group_size 32, e8m0}`.
+  On this port that declaration is **not honoured**: the weight-only kernel ignores activation quant,
+  and the rc6 kernel uses its own per-(token, 32-K-group) dynamic e4m3. Read the difference from
+  AMD-style whole-decoder builds as **coverage**, not activation width.
+* **Coverage is the only difference from `amd/Qwen3.8-27B-Quark-AWQ-MXFP4`,** which quantizes the
+  decoder's attention too: 496 quantized modules there vs **432** here on the same model, the delta
+  being exactly the 16 full-attention layers' q/k/v/o. (AMD's build also ships its MTP head in bf16
+  while omitting `mtp.*` from `exclude`, so it needs a 15-entry config patch before vLLM will load it
+  with spec-decode.)
+
+### Two build paths
+
+* **`ModelQuantizer.direct_quantize_checkpoint(...)`** — file-to-file, reads the snapshot directory and
+  writes the quantized one, never materializing the model. Used for five of six builds. Ships a
+  `model.safetensors.index.json`. Fast: ~4 min for the 27B on CPU; the 35B MoE stage took ~18.6 min
+  including a 70 GB download.
+* **`preprocess_for_quantization` → `quantize_model` → `freeze` → `export_safetensors`** — required when
+  the checkpoint stores experts as **stacked 3D tensors** (Gemma-4 MoE). The preprocess step explodes
+  them into per-expert Linears and frees the fused source, which is both what Quark needs to see them
+  and what vLLM's loader wants on the other end (`gemma4.py` accepts "already per-expert 2D weights (if
+  quantized)"). File-to-file quantized **0 of 3,840** expert modules before this path was used.
+  Caveat: this exporter writes a **single `model.safetensors` with no index file** (~206 s to quantize,
+  ~5 s to export for the 26B-A4B).
+
+Note that `direct_quantize_checkpoint` reads `config.json` off the filesystem — it does not resolve HF
+repo ids. Snapshot first, hand it the local directory.
+
+### Per-family exclude lists
+
+**None of these transfer between families.** They are derived per model from that repo's
+`model.safetensors.index.json`, because the module naming differs materially. The globs below are the
+driver input; the number in brackets is how many concrete module names Quark recorded in the artifact's
+`quantization_config.exclude` (only quantizable Linear/Conv modules are recorded, so `*norm*` and
+`*embed_tokens*` frequently contribute **zero** recorded entries — do not read their absence as the
+pattern not having applied).
+
+*Qwen3.8-27B* — `qwen3_5`, dense hybrid VL — 15 globs → **231** recorded:
+```
+lm_head, *embed_tokens*
+*.self_attn.{q,k,v,o}_proj, *.self_attn.{q,k}_norm
+*norm*
+*.linear_attn.conv1d, *.linear_attn.norm
+*.mlp.gate                 # MoE router name — inert on this dense model, kept for symmetry
+mtp*                       # whole MTP head: vLLM needs it unquantized for spec-decode
+*visual*, *vision*         # vision tower + merger + patch embed
+```
+*Ornith-1.0-35B* — `qwen3_5_moe` — the same list **plus** `*.mlp.shared_expert_gate` (16 globs).
+After the MTP graft (below) the recorded list is **1046** = 261 + the 785 grafted `mtp.*` modules named
+explicitly.
+
+*Muse-Glimmer-30B* — `muse_glimmer`, dense VL — 7 globs → **564** recorded:
+```
+lm_head, *embed_tokens*
+*self_attn*                # glob, NOT enumerated q/k/v/o — see quirk
+*norm*
+*vision_tower*, *vision_adapter*, *vision_projection*
+```
+
+*Mistral-Small-3.2-24B* — `mistral3`, dense — 6 globs → **333** recorded:
+```
+*lm_head*, *embed_tokens*
+*self_attn*, *norm*
+*vision_tower*, *multi_modal_projector*
+```
+
+*gemma-4-31B-it* — `gemma4`, dense — 7 globs → **419** recorded:
+```
+lm_head, *embed_tokens*, *embed_vision*
+*self_attn*, *layer_scalar*, *norm*, *vision_tower*
+```
+
+*gemma-4-26B-A4B-it* — `gemma4`, 128-expert MoE — 8 globs → **337** recorded: the 31B list **plus**
+`*router*`.
+
+### Family quirks (the part that does not transfer)
+
+* **Gemma-4's MoE router is `router.proj` / `router.scale` / `router.per_expert_scale`, not Qwen's
+  `mlp.gate`.** No tensor name in the checkpoint contains `.mlp.gate.` (only `.mlp.gate_proj.`, the
+  SwiGLU gate), so a copied Qwen list would have matched nothing and silently quantized all 30 routers.
+* **Muse-Glimmer has an extra `self_attn.gate_proj`** — a per-head output gate, `[4096, 6656]` — that an
+  enumerated q/k/v/o exclude list leaves exposed. The `*self_attn*` glob is what catches it.
+* **Mistral-Small nests as `language_model.model.layers.*`, not `model.language_model.*`,** and its
+  vision tower names modules `attention.` / `feed_forward.` rather than `self_attn.` / `mlp.` — so
+  `*self_attn*` does not reach the vision tower and `*vision_tower*` must carry it (169 of the 333
+  recorded entries).
+* **Gemma-4 carries a per-layer `layer_scalar`** that must stay bf16. It survives untouched — but it is
+  a bare parameter, not an `nn.Linear`, so it never appears in the recorded exclude list and the
+  `*layer_scalar*` pattern is probably inert. Kept as cheap insurance; **effect unverified** (no control
+  run without it).
+* **Gemma-4 has `v_proj` on only some layers** (`attention_k_eq_v`): 50 of 60 on the 31B, 25 of 30 on the
+  26B-A4B — the missing ones are exactly the `full_attention` layers. That is why the 26B's recorded
+  self-attn exclude count is 115, not 120; nothing went missing.
+* **Ornith-1.0-35B declares `mtp_num_hidden_layers: 1` but ships no `mtp.*` tensors** (verified against
+  the Hub: 0 of 31,666), so a plain requant serves with no speculative decoding. Its head is a
+  **cross-model graft**: 785 bf16 `mtp.*` tensors from a sibling Qwen3.6-35B-A3B MoE checkpoint with the
+  same hidden size and expert layout, added as one shard and named explicitly in `exclude`. Provenance
+  must be stated on any card that ships it — it is not an Ornith-trained head. MTP verification is
+  lossless by construction, so a mismatched head can only cost draft speed, never change outputs;
+  **acceptance rate on this checkpoint is unmeasured.**
+* **Qwen3.8-27B is the opposite case and needs no graft:** it declares *and ships* its own MTP head
+  (15 bf16 tensors, 8 of them Linears caught by `mtp*`). Do not generalize Ornith's graft to the family.
+* **AutoProcessor can fail to save** and the driver only prints the exception. It failed on every
+  multimodal build for want of `torchvision` / `pillow` in the quant venv. Harmless for the gemma-4
+  builds (upstream ships no `preprocessor_config.json` and the existing `processor_config.json` was
+  restored); **not harmless for Mistral-Small**, whose artifact is consequently missing
+  `preprocessor_config.json`, `processor_config.json`, `chat_template.jinja` and
+  `special_tokens_map.json`, with a 176-byte stub `tokenizer_config.json`. The vision weights are intact;
+  the config needed to feed them images is not there. Install both libraries before rebuilding.
+
+### Verification method
+
+Key on the **real Quark artifacts** — a module counts as quantized iff it has one of
+`weight_scale` / `weight_packed` / `qweight` / `weight_zero_point`. Then check **both directions**:
+
+1. *leakage* — nothing outside the intended set carries a quant artifact (attention, norms, embeddings,
+   `lm_head`, routers/gates, `conv1d`, vision, MTP);
+2. *over-exclusion* — every MLP/expert projection that should be 4-bit is 4-bit, per layer, with the
+   tensor accounting closing exactly (e.g. the 27B: base 1199 tensors + 432 `weight_scale` = 1631 in the
+   artifact, nothing dropped or renamed).
+
+Three traps, all of which bit this project:
+
+* **A bare `*_scale` suffix check gives false positives.** Gemma-4 ships `vision_tower.std_scale` and
+  Gemma-4 MoE ships `router.scale` / `router.per_expert_scale` in the *original bf16* repo. The naive
+  check reported a `model.vision_tower` "leak" on the 31B and 31 "leaks" on the 26B MoE (30 routers + 1
+  vision) on correct builds. Note `layer_scalar` cannot trip it — it ends `_scalar`.
+* **The verifier can silently no-op.** It keyed on `model.safetensors.index.json`; the
+  `export_safetensors` path writes none, so for the Gemma-4 MoE build it printed
+  `no index.json — cannot verify` and returned cleanly. Glob `*.safetensors` instead.
+* **A raised failure can still be swallowed.** The runner wrapped the driver in a shell pipeline, so the
+  `if` tested `sed`'s exit status: the 31B logged `VERIFY FAIL` and the runner printed ✅ on the next
+  line. Make failures raise **and** do not lose the exit status in a pipe.
+
+Current verification state of the six builds: three (Ornith, Glimmer, Mistral) passed the driver's own
+check at build time; the 31B's logged verify was the false positive above and was **never re-run by the
+driver**; the 26B MoE was **never checked by the driver at all**. Both were re-verified afterwards by
+direct safetensors-header inspection (31B: 180 modules, 0 leaks; 26B: 11,610 modules, 0 leaks). All six
+are structurally verified; five have never been loaded.
+
+### Quark MXFP4 builds
+
+Sizes are decimal GB of the artifact directory (GNU `du -h` rounds up, so it prints one unit higher).
+Artifacts are bind-mounted read-only into the serving container as `/quant/<name>`.
+
+| Artifact | Base | Arch | Quantized modules | Size (from base) | `exclude` | Status |
+|---|---|---|---|---|---|---|
+| `Qwen3.8-27B-MXFP4-Quark-RDNA4` | `Qwen/Qwen3.8-27B` (Apache-2.0) | `qwen3_5`, **dense** hybrid VL, 64 layers = 48 GDN linear-attn + 16 full-attn | **432** = 192 dense MLP (64×3) + 240 linear-attn projections (48×5) | 22.3 GB (20.7 GiB) from 55.6 GB — 40.1 % | 231 | **served + benchmarked** |
+| `Ornith-1.0-35B-MXFP4-Quark-RDNA4` | `deepreinforce-ai/Ornith-1.0-35B` (MIT per card) + grafted MTP head | `qwen3_5_moe` VL, 40 layers = 30 GDN + 10 full-attn, 256 experts + 1 shared | **30,990** = 30,720 expert (40×256×3) + 120 shared-expert + 150 linear-attn | 23.0 GB (21.4 GiB) from 70.2 GB — 32.7 % | 1046 | structurally verified, **not yet loaded** |
+| `Muse-Glimmer-30B-MXFP4-Quark-RDNA4` | `meta-models/Muse-Glimmer-30B` (Apache-2.0 + usage policy) | `muse_glimmer`, dense VL, 52 layers, GQA-2, 39 sliding (window 2048) + 13 full | **156** = 52×3 MLP | 29.1 GB (27.1 GiB) | 564 | structurally verified, **not yet loaded** |
+| `Mistral-Small-3.2-24B-MXFP4-Quark-RDNA4` | `mistralai/Mistral-Small-3.2-24B-Instruct-2506` (Apache-2.0) | `mistral3`, dense, 40 layers + Pixtral-style 24-layer vision tower | **120** = 40×3 MLP | 18.5 GB (17.2 GiB) | 333 | structurally verified, **not yet loaded**; processor config missing (see quirks) |
+| `gemma-4-31B-it-MXFP4-Quark-RDNA4` | `google/gemma-4-31B-it` | `gemma4`, dense, 60 layers = 50 sliding + 10 full, 27-layer vision tower | **180** = 60×3 MLP | 32.0 GB (29.8 GiB) from 62.5 GB — 1.96× | 419 | structurally verified, **not yet loaded** |
+| `gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4-moe` | `google/gemma-4-26B-A4B-it` | `gemma4` MoE, 30 layers × (128 experts + a dense MLP), 27-layer vision tower | **11,610** = 11,520 expert (128×30×3) + 90 dense MLP | 17.3 GB (16.1 GiB) from 51.6 GB — 2.98× | 337 | structurally verified, **not yet loaded**; single shard, **no index.json** |
+
+Sizes above are the whole artifact directory except for the 27B row, which quotes tensor bytes from the
+index (`du -sh` prints 21G). Base sizes are upstream bf16 index totals where a comparison is given.
 
 ## What's in the port
 - `vllm/model_executor/kernels/linear/mxfp4/rdna.py` — `RdnaMxfp4LinearKernel`: weight-only (A16)
@@ -52,8 +239,11 @@ vendor FP8). The policy above is about what this project *produces*.
   Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700), **all think-OFF (raw completions)**: single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
   FP8), c32 aggregate 649 (old 600, FP8 430); 6k-prefill c8 29 (old 22, FP8 32). **Think-ON is a different, slower
   shape — same box, 2026-08-16: c1 46.5, c16 384, c32 531; do not compare think-OFF and think-ON numbers.**
-  gsm8k n=50 ×3 seeds and
-  the 166-test analista suite unchanged vs the old kernel. Design lineage: Rob's `_matmul_fp8_ogs`
+  gsm8k n=50 ×3 seeds and a 166-case private application regression suite unchanged vs the old kernel.
+  **Scope: every think-OFF figure in this bullet was measured on the earlier RTN MXFP4 build of the same
+  model, not on the Quark build now serving** — no think-OFF sweep exists for the Quark build. The two
+  builds gate within noise on think-ON sweeps, so carrying the numbers over is an inference, not a
+  measurement. Design lineage: Rob's `_matmul_fp8_ogs`
   (0.24 line, W8A8) — same per-K-group scale fold on WMMA v2; this one adds the MXFP4 unpack.
 - Triton unified-attention: allow the 3D split-KV path for small-q spec-decode verify
   (`MAX_QLEN_3D=8`) — restores MTP/DFlash/DSpark verify throughput on gfx1201
@@ -69,11 +259,92 @@ Previous generation: `:0.19.1`.
 ## Models validated on this port (2× R9700, TP2 unless noted)
 | Model | Format | Spec-decode | Notes |
 |---|---|---|---|
-| Qwen3.8-27B (dense hybrid GDN/attn, VL, native MTP) | FP8 (stock) / **MXFP4** (ours) | MTP-3 | MXFP4: 262k window, ~61 tok/s think-OFF (rc6; 51 on rc5) / ~46 think-ON; FP8: 64k, ~63 tok/s think-OFF. Recipe: github.com/Capicua25x/qwen3.6-mxfp4-rdna4 |
-| Qwen3.6-35B-A3B distills (Ornith-1.0-35B, DSV4Pro-Thinking) | MXFP4 (compressed-tensors) | MTP-3 (grafted head) | ~75–107 tok/s single-stream; production engine 2026-06 → 2026-08-15 |
-| Muse-Glimmer-30B | MXFP4 / FP8-block | DFlash draft (z-lab) | dense; the first model brought up on this line (hence the old tag name) |
+| Qwen3.8-27B (dense hybrid GDN/attn, VL, native MTP) | FP8 (stock) / **MXFP4** (ours) | MTP-3 | MXFP4: 262k window, ~61 tok/s think-OFF (rc6; 51 on rc5) / ~46 think-ON; FP8: 64k, ~63 tok/s think-OFF. Both MXFP4 numbers are the RTN build; the Quark build now in production is in **Status** below. Recipe: **Quantization recipe** above |
+| Ornith-1.0-35B (`qwen3_5_moe` MoE) and a DSV4Pro-Thinking distill of Qwen3.6-35B-A3B | MXFP4 (compressed-tensors) | MTP-3 (grafted head) | ~75–107 tok/s single-stream; production engine 2026-06 → 2026-08-15. Ornith's own card describes the family as RL post-trained on Gemma 4 and Qwen 3.5 — its base lineage is **not established here**; the Quark rebuild is a separate, unserved artifact |
+| Muse-Glimmer-30B | MXFP4 (RTN, retired pipeline) / FP8-block | DFlash draft (z-lab) | dense; the first model brought up on this line (hence the old tag name). The Quark MXFP4 rebuild is a separate, unserved artifact |
 | RadixArk Qwen3.8-27B-DSpark | bf16 draft | DSpark block-7 (V2 model runner) | works; loses to native MTP-3 on this hardware (44 vs 63 tok/s) |
-| amd/Qwen3.8-27B-Quark-AWQ-MXFP4 | Quark W4A4 | MTP-3 (with `mtp.*` exclude patch) | runs as W4A16 on the RDNA kernel |
+| amd/Qwen3.8-27B-Quark-AWQ-MXFP4 | Quark W4A4 | MTP-3 (with `mtp.*` exclude patch) | runs as W4A16 on the RDNA kernel. Paired single-card run (TP1, 32k, 8 slots, MTP-3, 2026-08-15) vs our **RTN** build: 26.8 vs 27.1 tok/s — a dead heat; gsm8k n=50 0.96 flex / **0.78 strict** vs 0.98 / 0.98. On this hardware quantizing attention costs strict-format adherence, not throughput |
+
+## Status (2026-08-17)
+
+**Served, benchmarked, in production: one build.** `Qwen3.8-27B-MXFP4-Quark-RDNA4`, TP2 on 2× R9700 under
+rc6, TRITON_ATTN, MTP-3, 262k window, 32 slots, bf16 KV, selecting `RdnaMxfp4Fp8LinearKernel`. The
+serving checkpoint was switched from the retired RTN MXFP4 build to this Quark build on 2026-08-17 01:15;
+every number in this section was produced on the Quark build.
+
+Capacity gate at 262k / 32 slots: **KV pool 342,392 tokens**, **24.4 GB per GPU**, MTP mean acceptance
+length **3.10 / 2.85**. Reference bf16 = the same checkpoint served in bf16 by a hosted provider; FP8 =
+the vendor's own FP8 weights on this box.
+
+| Cell | n | MXFP4 (Quark) | bf16 ref | vendor FP8 (bf16 KV) |
+|---|---|---|---|---|
+| GSM8K think (flex / strict) | 50 | 0.96 / 0.94 | 0.96 / 0.82 | 0.96 / 0.90 |
+| GSM8K nothink (flex / strict) | 50 | 0.98 / 0.98 | 0.98 / 0.98 | 0.98 / 0.98 |
+| IFEval (inst / prompt strict) | 80 | 0.9688 / 0.9500 | 0.9688 / 0.9500 | 0.9688 / 0.9500 |
+| GPQA-Diamond | 60 | 0.9167 | 0.7833 | 0.8333 |
+| AIME'25 | 30 | 0.9333 | 0.9333 | 1.0000 |
+| AA-LCR (long context, LLM-judged) | 100 | 0.780 | 0.780 | 0.800 on the 90 it served / 0.720 over 100 |
+| τ²-Bench Telecom (thinking on) | 114 | 0.868 (99/114) | 0.939 (repaired) | 0.904 |
+| HLE | 120 | **not measured** | 0.3083 | not measured |
+
+Caveats that belong with those numbers, not in a footnote nobody reads:
+
+* **GSM8K think 0.96/0.94 is the top of a spread, not a repeat-measured result.** The build gate ran the
+  same seed on the same server 52 minutes earlier and three seeds gave 0.94/0.92, 0.94/0.88, 0.94/0.94 —
+  mean **0.940 / 0.913**. Sampling is temp 1.0 under continuous batching; the seed does not deliver
+  determinism.
+* **GPQA-D is a single run at n=60** with a stated ±3-item band, so +5 vs FP8 and +8 vs the bf16 reference
+  are real but unrepeated. Termination was clean (120/120 generations, 0 empty).
+* **AIME'25 is flagged suspicious by our own truncation auditor** — 1 of 30 items produced no output
+  (3.3 % hard, above the 2 % CLEAN threshold). Scored as wrong; the cell is a termination failure, not a
+  wrong answer.
+* **AA-LCR is judge-noisy.** Re-judging the identical file with the identical judge flips about 1 item per
+  100 (this build: 78 then 77). Same-pass comparisons put MXFP4, FP8 and bf16 within judge noise of each
+  other; do not read a 2–3 item gap as a quantization result.
+* **τ² Telecom compares unequal denominators.** The bf16 reference's 0.939 is a *repaired* number — 12
+  sims died on a provider-side error and were re-run and merged. This build's 0.868 is unrepaired, with 1
+  sim ending in error; on completed sims it is 99/113 = **0.876**.
+* **This is the only local arm with zero `__ERROR__` records across every completed generation cell.** The
+  262k window takes 100 % of the AA-LCR set; the 131k FP8 arm refused 10 % of it outright (prompts up to
+  122k tokens), which is the whole of that arm's 0.800-vs-0.720 split.
+* An earlier AA-LCR result of 0.730 for this build was **withdrawn**: it ran at temp 0.6 with
+  `reasoning_effort` omitted and mixed two configurations within one cell. The on-spec re-run is the 0.780
+  above. A cell is only paired if its *environment* is paired.
+
+**Throughput, think-ON** (chat endpoint, thinking enabled — not comparable to the think-OFF figures in
+*What's in the port*):
+
+| Shape | MXFP4 Quark | vendor FP8 + bf16 KV | vendor FP8 + fp8 KV |
+|---|---|---|---|
+| short, c1 | 47.7 | 53.6 | 46.3 |
+| short, c8 (per-user / agg) | 28.6 / 213 | 35.5 / 270 | 30.8 / 224 |
+| short, c16 | 26.5 / 384 | 28.6 / 433 | 27.1 / 398 |
+| short, c32 | 18.2 / 539 | not measured | not measured |
+| 6k, c1 | 46.3 | 49.6 | 46.4 |
+| 6k, c8 | 26.2 / 199 | 28.3 / 221 | 18.8 / 147 |
+| 6k, c16 | 16.9 / 260 | 18.7 / 284 | 11.3 / 176 |
+
+Stated plainly: with thinking on, MXFP4 is **~11 % below stock FP8 at single stream** (47.7 vs 53.6) and
+8–20 % below at c8–c16. Where it wins is capacity — it is the only arm measured at c32, and it carries a
+262k window with a 342K-token KV pool at 24.4 GB per GPU where the FP8 arm was configured at 131k.
+No think-OFF sweep and no prefill-only measurement exists for this build.
+
+**Still running or still owed** (single GPU pair, arms run serially): HLE 120 re-run, τ²-Bench Airline,
+τ²-Bench Retail, SWE-bench Verified, Terminal-Bench Hard-44, LiveCodeBench. An earlier HLE attempt
+returned HTTP 400 on **120 of 120** generations — a harness bug (an unsupported reasoning-effort value),
+not a capability measurement. It scored 0.0000 and the runner's guard correctly refused to publish it.
+**There is no HLE number for this build; 0.0000 must never be quoted as one.**
+
+**Structurally verified, never loaded: five builds** — Ornith-1.0-35B, Muse-Glimmer-30B,
+Mistral-Small-3.2-24B, gemma-4-31B-it, gemma-4-26B-A4B-it. Tensor-level policy verification passed for all
+five (0 leaks, 0 over-exclusion), but none has been loaded in vLLM: throughput, output quality, the vision
+paths, Ornith's grafted-MTP acceptance rate and even whether the loader accepts the bare `mtp.*` exclude
+names are all **unverified**.
+
+**Weights release:** the 27B build is being prepared for publication under `Capicua25x/` on Hugging Face
+with a model card carrying its base licence, attribution and statement of modification. Nothing is public
+at the time of writing. The five unserved builds are not release candidates yet — some have open base
+licence questions and none has serving evidence.
 
 ## Not here
 No PRs upstream by choice — the branch is carried on this fork (patches are separable:

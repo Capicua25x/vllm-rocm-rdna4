@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified 2026 by Capicua25x for the RDNA4 (gfx1200/gfx1201) port: register the RDNA4 MXFP4 linear kernels
+# (RdnaMxfp4LinearKernel, RdnaMxfp4Fp8LinearKernel) in the kernel selection list.
 
 """
 This module re-exports linear kernel implementations to provide a

@@ -2,6 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MXFP4 dense linear for AMD RDNA4 riding the FP8 WMMA datapath (W4A8-style).
 
+Design lineage
+--------------
+The core idea this kernel is built on -- folding the per-K-group scale into the
+fp32 accumulator *after* ``tl.dot`` rather than dequantizing operands up front,
+on WMMA v2 -- follows Rob Smith's (``tcclaviger``) ``_matmul_fp8_ogs`` from the
+vLLM 0.24 line, where it was done for W8A8.  This project's RDNA4 work descends
+from his gfx1201 enablement, and without it none of this exists.
+
+What is added here on top of that idea: the MXFP4 nibble -> e4m3 bit-pattern
+unpack (his was already 8-bit, so there was nothing to unpack), the E8M0 block
+scale in place of a per-tensor fp8 scale, and the three-regime dispatch below
+(fused decode / weight-only mid-M / exact bf16 dequant + hipBLASLt prefill).
+
 RDNA4 (gfx1200/gfx1201) has no microscaling datapath, but it does have native
 FP8 (e4m3fn) WMMA at roughly twice the bf16 rate.  ``RdnaMxfp4LinearKernel``
 unpacks MXFP4 tiles to bf16 inside the GEMM and pays for it on every token; this

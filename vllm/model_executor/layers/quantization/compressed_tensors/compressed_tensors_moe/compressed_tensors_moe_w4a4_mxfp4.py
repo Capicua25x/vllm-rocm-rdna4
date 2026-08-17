@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified 2026 by Capicua25x for the RDNA4 (gfx1200/gfx1201) port: gate MXFP4 MoE onto the RDNA
+# triton_kernels graft path when running on gfx1200/gfx1201.
 
 
 from functools import cache

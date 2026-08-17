@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified 2026 by Capicua25x for the RDNA4 (gfx1200/gfx1201) port: select the RDNA MXFP4 value
+# layout on gfx1200/gfx1201 instead of the CDNA4 scale swizzle.
 from typing import Any
 
 import torch

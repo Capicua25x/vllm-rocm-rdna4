@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified 2026 by Capicua25x for the RDNA4 (gfx1200/gfx1201) port: allow the 3D split-KV path for
+# small-q spec-decode verify shapes (MAX_QLEN_3D), restoring MTP verify throughput.
 
 # Authors:
 #  - Burkhard Ringlein <ngl@zurich.ibm.com>

@@ -15,11 +15,9 @@ Rob Smith (`tcclaviger`) for the vLLM 0.18.1 line and distributed as the image
 plus MXFP4/NVFP4 MoE kernels). That work was published as source at the time and
 forward-ported by this project to vLLM 0.19.1 in
 `Capicua25x/vllm-rocm-rdna4-legacy` (archived), and from there to the 0.26.1
-branch carried here. As of 2026-08-16 his source is no longer publicly available
-(his current RDNA4 work ships as the image `tcclaviger/vllm` with weights on
-Hugging Face); Apache-2.0 does not require source distribution, and the grants
-under which the earlier source was received are unaffected. This notice exists so
-the lineage remains on the record.
+branch carried here. Without his work none of this exists. His RDNA4 work is
+distributed as Docker images under `tcclaviger`. This notice exists so the
+lineage remains on the record.
 
 Separately, `vllm/model_executor/kernels/linear/mxfp4/rdna_fp8.py` takes its
 design lineage from Rob's `_matmul_fp8_ogs` (0.24 line, W8A8): the same
@@ -33,13 +31,20 @@ Original in this port (not derived from the above)
     including the FP8-WMMA decode path (rc6).
   * The speculative-decode verify fix: 3D split-KV path for small-q shapes
     (MAX_QLEN_3D) in the Triton unified attention kernel.
-  * The fp8-KV attention overlay for ROCm (enabling fp8 query input so K/V are not
-    dequantized inside the KV loop; kernel-dev/overlay/triton_attn.py).
-  * A clean-room Triton head-dim-512 flash-prefill chunking implementation whose
-    blueprint comes from llama.cpp (MIT); no llama.cpp code was copied.
+  * The RDNA4 gating in mxfp4_utils.py and compressed_tensors_moe_w4a4_mxfp4.py.
   * Model bring-up, serving recipes, and the A/B validation campaigns.
 
-Other components used or referenced (not modified, not redistributed here)
+Original to this project but carried OUTSIDE this branch, and so not part of the
+source in this repository:
+  * The fp8-KV attention overlay for ROCm (fp8 query input so K/V are not
+    dequantized inside the KV loop) - applied at container build time.
+  * A clean-room Triton head-dim-512 flash-prefill chunking implementation whose
+    blueprint comes from llama.cpp (MIT); no llama.cpp code was copied. It belongs
+    to the 0.19.1 line.
+
+Other components used or referenced (not modified, not redistributed in this
+source repository - the published Docker image does bundle them, under their
+own licenses)
 --------------------------------------------------------------------------
   * Triton / triton_kernels — MIT.
   * AMD ROCm (hipBLASLt, rocBLAS, RCCL, HIP) — MIT.
