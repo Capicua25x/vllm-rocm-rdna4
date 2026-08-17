@@ -49,8 +49,10 @@ vendor FP8). The policy above is about what this project *produces*.
   (128–512): the weight-only in-kernel path. Prefill (M > 512): exact integer dequant to bf16 into a
   reused scratch + hipBLASLt bf16 GEMM. Selected ahead of the bf16-unpack kernel; `VLLM_RDNA_MXFP4_FP8=0`
   disables; `VLLM_RDNA_MXFP4_FP8_SKIP=<prefix,…>` keeps named layers on bf16 activations.
-  Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700): single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
-  FP8), c32 aggregate 649 (old 600, FP8 430); 6k-prefill c8 29 (old 22, FP8 32). gsm8k n=50 ×3 seeds and
+  Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700), **all think-OFF (raw completions)**: single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
+  FP8), c32 aggregate 649 (old 600, FP8 430); 6k-prefill c8 29 (old 22, FP8 32). **Think-ON is a different, slower
+  shape — same box, 2026-08-16: c1 46.5, c16 384, c32 531; do not compare think-OFF and think-ON numbers.**
+  gsm8k n=50 ×3 seeds and
   the 166-test analista suite unchanged vs the old kernel. Design lineage: Rob's `_matmul_fp8_ogs`
   (0.24 line, W8A8) — same per-K-group scale fold on WMMA v2; this one adds the MXFP4 unpack.
 - Triton unified-attention: allow the 3D split-KV path for small-q spec-decode verify
@@ -67,7 +69,7 @@ Previous generation: `:0.19.1`.
 ## Models validated on this port (2× R9700, TP2 unless noted)
 | Model | Format | Spec-decode | Notes |
 |---|---|---|---|
-| Qwen3.8-27B (dense hybrid GDN/attn, VL, native MTP) | FP8 (stock) / **MXFP4** (ours) | MTP-3 | MXFP4: 262k window, ~61 tok/s (rc6; 51 on rc5); FP8: 64k, ~63 tok/s. Recipe: github.com/Capicua25x/qwen3.6-mxfp4-rdna4 |
+| Qwen3.8-27B (dense hybrid GDN/attn, VL, native MTP) | FP8 (stock) / **MXFP4** (ours) | MTP-3 | MXFP4: 262k window, ~61 tok/s think-OFF (rc6; 51 on rc5) / ~46 think-ON; FP8: 64k, ~63 tok/s think-OFF. Recipe: github.com/Capicua25x/qwen3.6-mxfp4-rdna4 |
 | Qwen3.6-35B-A3B distills (Ornith-1.0-35B, DSV4Pro-Thinking) | MXFP4 (compressed-tensors) | MTP-3 (grafted head) | ~75–107 tok/s single-stream; production engine 2026-06 → 2026-08-15 |
 | Muse-Glimmer-30B | MXFP4 / FP8-block | DFlash draft (z-lab) | dense; the first model brought up on this line (hence the old tag name) |
 | RadixArk Qwen3.8-27B-DSpark | bf16 draft | DSpark block-7 (V2 model runner) | works; loses to native MTP-3 on this hardware (44 vs 63 tok/s) |
