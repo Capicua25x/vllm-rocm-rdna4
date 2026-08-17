@@ -23,6 +23,20 @@ attention overlay (fp8 query input, so K/V are not dequantized inside the KV loo
 head-dim-512 flash-prefill kernel (blueprint from llama.cpp, MIT, no code copied); model bring-up,
 serving recipes and the validation campaigns. See `NOTICE`.
 
+## Quantization policy (2026-08-16)
+
+**4-bit: AMD Quark / MXFP4 only.** Everything quantized in-house goes through Quark and ships as MXFP4; the RTN
+pipeline is retired for new work. **NVFP4 is not a target on this port** — an RDNA4 NVFP4 implementation exists for
+vLLM 0.19.1 in `Capicua25x/vllm-rocm-rdna4-legacy` (archived, Gemma-4 MoE + head-512 flash prefill) and is
+deliberately not forward-ported; revisit only if a required checkpoint is NVFP4-only. On RDNA4 there is no FP4
+datapath, so both formats are "unpack E2M1 into something the WMMA unit eats" — the difference is scale handling
+(MXFP4: E8M0 per 32; NVFP4: e4m3 per 16 + tensor fp32), i.e. a scale change in one kernel, not a new port.
+
+**8-bit: the vendor's own FP8** (e.g. `Qwen/Qwen3.8-27B-FP8`) — native FP8 WMMA on gfx1201, no in-house work needed.
+
+**Consumption is unrestricted**: the port loads what the ecosystem publishes (Quark, compressed-tensors, AWQ/GPTQ,
+vendor FP8). The policy above is about what this project *produces*.
+
 ## What's in the port
 - `vllm/model_executor/kernels/linear/mxfp4/rdna.py` — `RdnaMxfp4LinearKernel`: weight-only (A16)
   MXFP4 dense linear for RDNA4 (no hardware MX datapath): in-kernel Triton dequant of 4-bit tiles
