@@ -306,7 +306,7 @@ index (`du -sh` prints 21G). Base sizes are upstream bf16 index totals where a c
   (128–512): the weight-only in-kernel path. Prefill (M > 512): exact integer dequant to bf16 into a
   reused scratch + hipBLASLt bf16 GEMM. Selected ahead of the bf16-unpack kernel; `VLLM_RDNA_MXFP4_FP8=0`
   disables; `VLLM_RDNA_MXFP4_FP8_SKIP=<prefix,…>` keeps named layers on bf16 activations.
-  Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700), **all think-OFF (raw completions)**: single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
+  Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700), **all `--think raw`** — the bench's `/v1/completions` path at **temperature 0**, i.e. greedy. That is NOT the same as `--think off`, which uses `/v1/chat/completions` at temp 0.6 / top_p 0.95. The distinction matters here because this build runs MTP-3 speculative decoding: greedy decoding accepts most drafted tokens (mean acceptance 3.10), while sampled decoding rejects far more, so raw reads ~61 tok/s where chat-off reads ~51 on the same weights. Production sampling is the chat path; quote raw figures only against other raw figures: single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
   FP8), c32 aggregate 649 (old 600, FP8 430); 6k-prefill c8 29 (old 22, FP8 32). **Think-ON is a different, slower
   shape — same box, 2026-08-16: c1 46.5, c16 384, c32 531; do not compare think-OFF and think-ON numbers.**
   gsm8k n=50 ×3 seeds and a 166-case private application regression suite unchanged vs the old kernel.
