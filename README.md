@@ -28,6 +28,10 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ## About
 
+> **⚡ 2026-08-20 — major performance upgrade (rc10):** tuned per-shape GEMM configs for the R9700
+> (regenerated with vLLM's own tuner) ship in-tree. Short-prompt c32 aggregate: FP8 arm **754 → 1,014
+> tok/s (+34%)**, MXFP4 arm **579 → 713 (+23%)**; every cell improved. Image: `capicua25x/vllm-rocm-rdna4:latest`.
+
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 
 Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
