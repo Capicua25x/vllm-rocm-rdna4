@@ -1109,14 +1109,13 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
-    # RDNA4 verify fix (glimmer-port 08-12): permitir el camino 3D (split-KV)
-    # también para formas de verify de spec-decode (q_len pequeño >1). Con el
-    # gate original `max_seqlen_q > 1`, un verify MTP de q_len=4 sobre KV~7k
-    # caía al grid 2D (≈8-10 workgroups en 64 CUs) → 1.279 µs/lanzamiento.
-    # Los buffers de segmentos se indexan POR TOKEN (reduce_segments ya es
-    # per-token), así que el guardián de capacidad correcto es q.shape[0]
-    # (tokens), no num_seqs. Mismo gate que intentan los PRs upstream
-    # estancados #45450/#46724/#44652.
+    # RDNA4 verify fix (2026-08-12): allow the 3D (split-KV) path also for
+    # spec-decode VERIFY shapes (small q_len > 1). With the original
+    # `max_seqlen_q > 1` gate, an MTP verify of q_len=4 over ~7k KV fell to the
+    # 2D grid (~8-10 workgroups on 64 CUs) -> 1,279 us/launch. The segment
+    # buffers are indexed PER TOKEN (reduce_segments already is), so the correct
+    # capacity guard is q.shape[0] (tokens), not num_seqs. Same gate change
+    # attempted by stalled upstream PRs #45450/#46724/#44652.
     MAX_QLEN_3D = 8
     use_3d = not (
         seq_threshold_3D is None
