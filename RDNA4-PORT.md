@@ -377,29 +377,29 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 | KV pool @32 slots | **539k tokens (2.06× window)** | 415k (1.6×) |
 | pick when | max context capacity / short-prompt throughput | best per-user speed at real context sizes |
 
-*B measured with the in-tree tuned R9700 GEMM configs (2026-08-20).*
+*B and C both measured on the rc10 image (2026-08-20; B carries the in-tree tuned R9700 GEMM configs).*
 
 **Throughput** (think ON, `max_tokens 256`, per-user / aggregate tok/s, warm serve, first-run cells).
 Short prompts (~30 tok):
 
 | users | B | C |
 |---|---|---|
-| 1 | 66 / 66 | 55 / 55 |
-| 4 | 60 / 232 | 42 / 163 |
-| 8 | 54 / 421 | 35 / 252 |
-| 16 | 45 / 687 | 27 / 394 |
-| 32 | 33 / **1,014** | 20 / 579 |
-| 64 | 24 / **1,016** | 14 / 561 |
+| 1 | 66 / 66 | 62 / 62 |
+| 4 | 60 / 232 | 53 / 208 |
+| 8 | 54 / 421 | 42 / 335 |
+| 16 | 45 / 687 | 32 / 505 |
+| 32 | 33 / **1,014** | 24 / 713 |
+| 64 | 24 / **1,016** | 17 / 714 |
 
 6,000-token prompts (RAG / long-system-prompt workloads):
 
 | users | B | C |
 |---|---|---|
-| 1 | 61 / 61 | 47 / 47 |
-| 4 | 43 / 170 | 37 / 133 |
-| 8 | 31 / 241 | 27 / 200 |
-| 16 | 20 / 311 | 18 / 273 |
-| 32 | 11 / 356 | 11 / 325 |
+| 1 | 61 / 61 | 54 / 54 |
+| 4 | 43 / 170 | 43 / 163 |
+| 8 | 31 / 241 | 30 / 231 |
+| 16 | 20 / 311 | 20 / 312 |
+| 32 | 11 / 356 | 12 / 368 |
 
 **Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
 window, MTP-3, 32 slots). The A/B pair we run in production:
