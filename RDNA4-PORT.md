@@ -448,7 +448,7 @@ for all judged rows. Every number is the FIRST run at the stated n — reruns ar
 | — seeds 7 / 99 | — | 0.96·0.84 / 0.96·0.90 | 0.98·0.98 / 0.96·0.90 |
 | GSM8K non-thinking (50) | 0.98·0.98 | 0.98·0.98 | 0.98·0.98 |
 | IFEval, inst·prompt strict (80) | 0.97·0.95 | 0.98·0.98 | 0.97·0.95 |
-| Long-context reasoning, judged (100) | 0.78 | 0.77 | 0.78 |
+| Long-context reasoning, judged (100) | 0.78 | 0.81 | 0.78 |
 | GPQA-Diamond (60) | 0.78 | 0.85 | 0.92 |
 | AIME'25 (30) | 0.93 | 0.97 | 0.93 |
 | τ²-Bench telecom (114) | 0.939 | ⏳ | 0.904 |
