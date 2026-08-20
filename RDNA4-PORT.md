@@ -365,6 +365,37 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 | long-context reasoning (100 items, judged) | 0.77–0.81 | 0.78 |
 | pick when | max context capacity / single-user latency | max multi-user throughput at real context sizes |
 
+**Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k window, MTP-3, 32 slots):
+
+```bash
+# B · FP8 stock + fp8 KV — max context capacity (pool ≈ 2.06× the window)
+docker run --rm --name vllm-qwen --network=host \
+  --device=/dev/kfd --device=/dev/dri/renderD128 --device=/dev/dri/renderD129 \
+  --group-add=video --group-add=render --ipc=host \
+  -e NCCL_PROTO=Simple \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --entrypoint /usr/local/bin/vllm capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc9 \
+  serve Qwen/Qwen3.8-27B-FP8 --served-model-name qwen --port 8011 --trust-remote-code \
+  --tensor-parallel-size 2 --gpu-memory-utilization 0.95 --max-model-len 262144 \
+  --attention-backend TRITON_ATTN --enable-prefix-caching \
+  --max-num-seqs 32 --max-num-batched-tokens 8000 --max-cudagraph-capture-size 128 \
+  --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 \
+  --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
+
+# C · MXFP4 (Quark) + bf16 KV — max multi-user throughput at real context sizes
+#   same command with:  serve Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4
+#   and WITHOUT:        --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16
+
+# D · MXFP4 + fp8 KV (experimental) — largest pool measured (≈ 3.11× the window)
+#   C's checkpoint + B's two KV flags:  serve Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4
+#                                       --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16
+```
+
+The rc9 env knobs (`VLLM_RDNA_HW_FP8CVT=1`, `VLLM_RDNA_P_SCALE=256`) are the defaults — set them to `0`/`1`
+respectively only to A/B against upstream behavior. On the fp8-KV configs, note the checkpoint ships no
+KV-cache scale tensors (scale 1.0; our amax survey peaked at 147 vs e4m3's 448, so nothing clips).
+
 There is also a **D config** — MXFP4 + fp8 KV + bf16 SSM state on rc9 — which combines C's weight
 bandwidth with the largest pool we have measured (**814,943 tokens = 3.11× the window**, best
 short-prompt aggregate 629 @c32, −8…−16 % vs C on the fair cell). Use it for 100k-token-class
