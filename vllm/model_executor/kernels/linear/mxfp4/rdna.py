@@ -29,21 +29,20 @@ Wiring — three edits live outside this file, in
      harmless — AITER declines on gfx12 today)
   3. add the name to ``__all__``
 
-IMPORTANTE — acoplamiento con ``Platform.supports_mx()``:
-    Este kernel NO consulta ``current_platform.supports_mx()`` y no debe
-    hacerlo.  Hoy ``supports_mx()`` significa "hardware con microscaling
-    NATIVO" (``gfx95`` / ``gfx1250``); gfx1201 no es eso — aquí el MXFP4 se
-    resuelve con un dequant Triton dentro del kernel.  El gate de este archivo
-    es ``on_rdna4()`` + presencia del graft, precisamente para no depender de
-    ese predicado.
+IMPORTANT — coupling with ``Platform.supports_mx()``:
+    This kernel does NOT consult ``current_platform.supports_mx()`` and must
+    not.  Today ``supports_mx()`` means "hardware with NATIVE microscaling"
+    (``gfx95`` / ``gfx1250``); gfx1201 is not that — here MXFP4 is resolved by
+    a Triton dequant inside the kernel.  This file gates on ``on_rdna4()`` +
+    graft presence precisely to avoid depending on that predicate.
 
-    Si alguna vez se extiende ``supports_mx()`` a gfx12, ese cambio y este
-    archivo tienen que aterrizar JUNTOS, en el mismo commit: ensanchar
-    ``supports_mx()`` por su cuenta haría que ``AiterMxfp4LinearKernel``
-    reclamara gfx1201 (su ``is_supported`` empieza justo por ese predicado) y
-    rompería el fallback de emulación que hoy SÍ funciona.  En ese mismo commit
-    hay que auditar los demás consumidores, porque varios pasarían a reclamar
-    MXFP8 nativo, que el graft no provee:
+    If ``supports_mx()`` is ever extended to gfx12, that change and this file
+    must land TOGETHER, in the same commit: widening ``supports_mx()`` on its
+    own would make ``AiterMxfp4LinearKernel`` claim gfx1201 (its
+    ``is_supported`` starts with exactly that predicate) and break the
+    emulation fallback that works today.  The same commit must audit the other
+    consumers, because several would start claiming native MXFP8, which the
+    graft does not provide:
       - ``kernels/linear/mxfp4/aiter.py``
       - ``kernels/linear/mxfp4/emulation.py``
       - ``kernels/linear/mxfp8/rocm_native.py``
@@ -73,7 +72,7 @@ logger = init_logger(__name__)
 MXFP4_GROUP_SIZE = 32
 
 # E2M1 lookup table, index = nibble value, low nibble first.  Same table as the
-# operator's 0.19.1 RDNA4 patch and as quark's `dq_mxfp4` (which backs
+# project's earlier 0.19.1 RDNA4 patch and as quark's `dq_mxfp4` (which backs
 # `torch.ops.vllm.dequant_mxfp4`).
 # TODO(rdna-mxfp4): add a unit test asserting this table reproduces
 # `dequant_mxfp4` bit-for-bit on a random uint8 weight — it is only used by the
@@ -172,7 +171,7 @@ def _dequant_mxfp4_reference(
 
     Deliberately does not call ``torch.ops.vllm.dequant_mxfp4``: that op needs
     the optional ``amd-quark`` package, and this fallback has to stay reachable
-    whenever the fast path declines.  Algorithm copied from the operator's
+    whenever the fast path declines.  Algorithm copied from this project's earlier
     0.19.1 RDNA4 patch (``_dequant_mxfp4_to_dtype``).
     """
     lut = torch.tensor(_FP4_E2M1_LUT, dtype=torch.float32, device=weight.device)
@@ -192,11 +191,11 @@ def _dequant_mxfp4_reference(
     return (w * scale).to(out_dtype)
 
 
-# NOTE: no importar triton_kernels a nivel de módulo.  Igual que en aiter.py,
-# importarlo temprano puede inicializar HIP y forzar que el engine core haga
-# spawn en vez de fork.  `_is_rdna4_platform()` sólo consulta el arch string
-# resuelto por amdsmi, así que es HIP-free; los imports reales viven dentro del
-# cuerpo del custom op, que sólo corre sobre el device.
+# NOTE: do not import triton_kernels at module level.  As in aiter.py,
+# importing it early can initialize HIP and force the engine core to spawn
+# instead of fork.  `_is_rdna4_platform()` only consults the arch string
+# resolved by amdsmi, so it is HIP-free; the real imports live inside the
+# custom-op body, which only runs on the device.
 if _is_rdna4_platform():
     from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -270,13 +269,13 @@ if _is_rdna4_platform():
             flex_ctx=FlexCtx(rhs_data=InFlexData()),
         )
 
-        # RoutingData explícito, NO None — esto es rendimiento, no cosmética.
-        # Con `routing_data=None`, matmul_ogs sustituye
-        # `RoutingData(None, None, max(1, w.shape[0]), 1)`; para un peso denso
-        # `w.shape[0]` es K, así que opt_flags calcula
-        # `tokens_per_expt = max(1, M // K) == 1` y clava `block_m = 16` para
-        # toda M.  El resultado es idéntico bit a bit, pero mucho más lento en
-        # M grande.  Con n_expts_tot=1, `tokens_per_expt == M`.
+        # Explicit RoutingData, NOT None — this is performance, not
+        # cosmetics.  With `routing_data=None`, matmul_ogs substitutes
+        # `RoutingData(None, None, max(1, w.shape[0]), 1)`; for a dense weight
+        # `w.shape[0]` is K, so opt_flags computes
+        # `tokens_per_expt = max(1, M // K) == 1` and pins `block_m = 16` for
+        # every M.  The result is bit-identical, but much slower at large M.
+        # With n_expts_tot=1, `tokens_per_expt == M`.
         routing_data = RoutingData(None, None, 1, 1)
 
         y = matmul_ogs(
@@ -376,13 +375,13 @@ class RdnaMxfp4LinearKernel(MxFp4LinearKernel):
         # this kernel is ever selected.  Exactly the precedent set by
         # MarlinMxFp4LinearKernel and HummingMxFp4LinearKernel (same wording).
         #
-        # CONSECUENCIA NUMÉRICA, explícita: cuando el config pide
-        # kMxfp4Dynamic, EmulationMxfp4LinearKernel además hace QDQ de la
-        # activación (`quant_dequant_mxfp4(x)`); este kernel NO.  El resultado
-        # es MÁS preciso, no menos, pero NO es bit-idéntico al camino que hoy
-        # corre en producción.  Cualquier A/B contra la emulación tiene que
-        # comparar contra `dequant_mxfp4 + F.linear` SIN el QDQ, o la
-        # diferencia se atribuirá al kernel por error.
+        # NUMERIC CONSEQUENCE, stated explicitly: when the config asks for
+        # kMxfp4Dynamic, EmulationMxfp4LinearKernel additionally QDQs the
+        # activation (`quant_dequant_mxfp4(x)`); this kernel does NOT.  The
+        # result is MORE precise, not less, but it is NOT bit-identical to
+        # the emulation path.  Any A/B against the emulation must compare
+        # against `dequant_mxfp4 + F.linear` WITHOUT the QDQ, or the
+        # difference will be misattributed to the kernel.
         if config.activation_quant_key not in (None, kMxfp4Dynamic):
             return False, "only supports MXFP4 dynamic or unquantized activations"
         if config.activation_quant_key is not None:
@@ -509,51 +508,52 @@ class RdnaMxfp4LinearKernel(MxFp4LinearKernel):
         return y.reshape(out_shape)
 
 
-# ── Cabos sueltos / TODOs ────────────────────────────────────────────────────
+# ── Loose ends / TODOs ──────────────────────────────────────────────────────
 #
-# 1. TODO(rdna-mxfp4) — VALIDACIÓN NUMÉRICA OBLIGATORIA ANTES DE HACER SHIP.
-#    El parche RDNA4 0.19.1 del operador usaba `RDNAMXValueLayout` SÓLO en la
-#    ruta MoE (`_swizzle_mxfp4` -> gpt_oss_triton_kernels_moe); su camino denso
-#    W4A16 dequantizaba en tiempo de carga y llamaba a F.linear.  O sea: el
-#    cableado denso de este archivo NO tiene precedente probado.  Antes de
-#    promocionarlo hay que comparar, capa por capa, contra
-#    `F.linear(x, dequant_mxfp4(w, s, x.dtype), bias)` (sin QDQ de activación).
-#    Y ojo con el modo de fallo peligroso: si las dos transposiciones se
-#    intercambiaran, la forma de salida seguiría siendo correcta en toda
-#    proyección CUADRADA (q/k/v/o de un modelo con head_dim uniforme), así que
-#    NINGUNA comprobación de shape lo detecta — sólo el test numérico.
-#    Tolerancia: en bf16 la igualdad exacta se da a M pequeño; a M grande
-#    aparecen diferencias del orden de 1 ULP por el orden de acumulación.  Usar
-#    rtol ~1e-2 en bf16, o comparar en fp32 con atol = y.abs().max() * 3e-3.
+# 1. Numeric validation — DONE (kernel-level and end-to-end). This project's
+#    earlier 0.19.1 patch used `RDNAMXValueLayout` ONLY on the MoE route
+#    (`_swizzle_mxfp4` -> gpt_oss_triton_kernels_moe); its dense W4A16 path
+#    dequantized at load time and called F.linear, so this file's dense wiring
+#    had no proven precedent when written.  Since validated against the
+#    dequant oracle (tests/kernels/quantization/test_rdna_mxfp4_fp8.py, which
+#    compares against `F.linear(x, dequant_mxfp4(w, s, x.dtype), bias)` with
+#    no activation QDQ) and end-to-end by the serving gates in RDNA4-PORT.md
+#    (2026-08-15 onward).  The dangerous failure mode remains worth knowing:
+#    if the two transpositions were swapped, the output shape would still be
+#    correct for every SQUARE projection (q/k/v/o of a uniform-head_dim
+#    model), so NO shape check catches it — only the numeric test does.
+#    Tolerance: in bf16, exact equality holds at small M; at large M,
+#    ~1-ULP differences appear from accumulation order.  Use rtol ~1e-2 in
+#    bf16, or compare in fp32 with atol = y.abs().max() * 3e-3.
 #
-# 2. TODO(rdna-mxfp4) — el contrato de `matmul_ogs` que asume este archivo
-#    (w column-major, escala lógica [K//32, N], RoutingData explícito,
-#    `is_persistent=False` en la rama RDNA4 de opt_flags) se verificó leyendo
-#    una COPIA de `triton_kernels/matmul_ogs.py`, no la wheel exacta que el
-#    Dockerfile injerta en site-packages.  Re-verificar contra la wheel
-#    instalada antes de confiar en él; un cambio upstream en el orden de
-#    `w_scale_strides` (hoy: e, k, n = strides[-3:]) rompería las escalas en
-#    silencio.
+# 2. TODO(rdna-mxfp4) — the `matmul_ogs` contract this file assumes
+#    (w column-major, logical scale [K//32, N], explicit RoutingData,
+#    `is_persistent=False` in the RDNA4 branch of opt_flags) was verified by
+#    reading a COPY of `triton_kernels/matmul_ogs.py`, not the exact wheel the
+#    Dockerfile grafts into site-packages.  Re-verify against the installed
+#    wheel before relying on it; an upstream change in the order of
+#    `w_scale_strides` (today: e, k, n = strides[-3:]) would break the scales
+#    silently.
 #
-# 3. Numérica bf16 (por qué se espera igualdad con el oráculo): los valores
-#    E2M1 (0.5 … 6.0) y las escalas E8M0 (potencias exactas de dos) son
-#    representables exactamente en bf16, así que el `w_dequant * scale` que
-#    hace el kernel en bf16 coincide con el `(w * scale_fp32).to(bf16)` de la
-#    referencia.  La acumulación es fp32 en ambos casos.
+# 3. bf16 numerics (why equality with the oracle is expected): E2M1 values
+#    (0.5 … 6.0) and E8M0 scales (exact powers of two) are exactly
+#    representable in bf16, so the kernel's bf16 `w_dequant * scale` matches
+#    the reference's `(w * scale_fp32).to(bf16)`.  Accumulation is fp32 in
+#    both cases.
 #
-# 4. Valores límite de E8M0 (documentados, NO "arreglados" en silencio):
-#    `mxfp4_dequant_rdna` convierte el byte 0x00 a bf16 0.0 y 0xFF a +inf,
-#    mientras que la referencia fp32 da 2^-127 y un exponente saturado.  Con
-#    OUT_DTYPE=fp16 además satura el exponente al rango [0, 30], o sea que las
-#    escalas extremas se recortan.  No ocurre en checkpoints reales de
-#    compressed-tensors; si algún día ocurre, se verá como degradación muda.
+# 4. E8M0 edge values (documented, NOT silently "fixed"):
+#    `mxfp4_dequant_rdna` converts byte 0x00 to bf16 0.0 and 0xFF to +inf,
+#    while the fp32 reference gives 2^-127 and a saturated exponent.  With
+#    OUT_DTYPE=fp16 it additionally saturates the exponent to [0, 30], i.e.
+#    extreme scales are clipped.  Does not occur in real compressed-tensors
+#    checkpoints; if it ever does, it will present as silent degradation.
 #
-# 5. Rendimiento: el margen de tuning vive en la rama RDNA4 de `opt_flags` del
-#    graft (block_n, num_stages, split_k para M flaca), NO aquí.  NO llamar a
-#    `update_opt_flags_constraints` desde este archivo: es estado global del
-#    proceso y se filtraría a la ruta MoE.
+# 5. Performance: the tuning headroom lives in the graft's RDNA4 branch of
+#    `opt_flags` (block_n, num_stages, split_k for thin M), NOT here.  Do NOT
+#    call `update_opt_flags_constraints` from this file: it is process-global
+#    state and would leak into the MoE route.
 #
-# 6. TODO(rdna-mxfp4) — sin verificar bajo captura de cudagraph.  El custom op
-#    con `fake_impl` es lo que exige el precedente de aiter.py, pero la ruta
-#    completa (matmul_ogs + autotune del graft dentro de un grafo capturado) no
-#    se ha probado en este hardware.
+# 6. TODO(rdna-mxfp4) — unverified under cudagraph capture.  The custom op
+#    with `fake_impl` is what the aiter.py precedent requires, but the full
+#    path (matmul_ogs + the graft's autotune inside a captured graph) has not
+#    been exercised on this hardware.

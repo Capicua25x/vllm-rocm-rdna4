@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MuseGlimmer attention config-schema normalization (native flat vs modular).
 
 Regression test for the modular-config degenerate-output bug: the modular HF

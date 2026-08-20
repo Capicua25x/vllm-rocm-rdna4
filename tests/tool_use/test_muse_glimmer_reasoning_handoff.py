@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Guards the reasoning-parser -> tool-parser handoff for MuseGlimmer.
 
 Regression test for the bug where a reasoning+tool-call turn returned

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MuseGlimmer config normalization: flat (legacy-converter) and nested (canonical).
 
 Guards against the silent-ignore bug where a FLAT MuseGlimmer config.json (older

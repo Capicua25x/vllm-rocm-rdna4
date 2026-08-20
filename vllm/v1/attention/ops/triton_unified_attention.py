@@ -39,10 +39,23 @@ logger = init_logger(__name__)
 # LLVM-IR library (rdnacvt.ll next to this file). Triton 3.6.0's AMD backend open-codes these casts (33 / 26
 # VALU + 10 / 9 s_wait_alu per element); measured -33% on the fp8-Q attention kernel, outputs identical.
 # VLLM_RDNA_HW_FP8CVT=0 restores the software casts for A/B. Inert on the bf16 (arm C) path.
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.environ.get('RDNACVT_DIR', _os.path.dirname(_os.path.abspath(__file__))))
-import rdna_cvt as _rdna_cvt
-_HW_CVT = _os.environ.get('VLLM_RDNA_HW_FP8CVT', '1') == '1'
+from vllm.v1.attention.ops import rdna_cvt as _rdna_cvt
+
+def _rdna4_platform() -> bool:
+    try:
+        from vllm.platforms import current_platform as _cp
+        if not _cp.is_rocm():
+            return False
+        from vllm.platforms.rocm import on_rdna4
+        return on_rdna4()
+    except Exception:
+        return False
+
+# Hardware fp8 converts are RDNA4-only: the extern .ll targets amdgcn gfx12, so
+# the default must never turn on for other platforms (a CUDA/CDNA build linking
+# __rdnacvt_* symbols would fail kernel compilation).
+_HW_CVT = _rdna4_platform() and os.environ.get('VLLM_RDNA_HW_FP8CVT', '1') == '1'
+_RDNA_TILE_PREFILL = int(os.environ.get('VLLM_RDNA_TILE_PREFILL', '32'))
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -843,7 +856,7 @@ def _get_tile_size(
     # (measured: TILE=16 on the fp8-Q 2D path is -15% instr/KV-token, 256->145 VGPR, 0 spills; e2e unmeasured).
     if is_prefill:
         if element_size == 1:
-            return int(os.environ.get('VLLM_RDNA_TILE_PREFILL', '32'))
+            return _RDNA_TILE_PREFILL
         return 32
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
@@ -997,8 +1010,7 @@ def unified_attention(
     # other clause and gets the untuned, decode-oriented tiling on prefill-shaped launches -- which
     # is where our measured ~3.2K tok/s prefill ceiling lives. VLLM_RDNA_TUNED_HEAD=1 lets the same
     # tuning apply on ROCm so it can be measured; unset, behaviour is byte-identical to upstream.
-    import os as _rdna_os
-    _rdna_allow = _rdna_os.environ.get("VLLM_RDNA_TUNED_HEAD", "0") == "1"
+    _rdna_allow = os.environ.get("VLLM_RDNA_TUNED_HEAD", "0") == "1"
     tuned_large_head = (
         head_size == 256
         and max_seqlen_q > 1
@@ -1014,14 +1026,14 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
     # Explicit sweep overrides, applied last so they win over every heuristic above.
-    _rdna_bm = _rdna_os.environ.get("VLLM_RDNA_BLOCK_M")
+    _rdna_bm = os.environ.get("VLLM_RDNA_BLOCK_M")
     if _rdna_bm:
         BLOCK_M = int(_rdna_bm)
         BLOCK_Q = max(1, BLOCK_M // num_queries_per_kv)
-    _rdna_w = _rdna_os.environ.get("VLLM_RDNA_WARPS")
+    _rdna_w = os.environ.get("VLLM_RDNA_WARPS")
     if _rdna_w:
         launch_num_warps = int(_rdna_w)
-    _rdna_s = _rdna_os.environ.get("VLLM_RDNA_STAGES")
+    _rdna_s = os.environ.get("VLLM_RDNA_STAGES")
     if _rdna_s:
         launch_num_stages = int(_rdna_s)
 

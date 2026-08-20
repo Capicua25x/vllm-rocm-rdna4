@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MXFP4 weights (E2M1 nibbles + E8M0 block-32 scales) x fp8-e4m3 activations, on RDNA4 FP8 WMMA.
 acc += dot(x8[BM,32], w8[32,BN]) * scale[block, n]  ;  y = acc * sx[m]
 Weight layout: packed uint8 [N, K//2] row-major (low nibble = even k), scales uint8 [N, K//32]."""

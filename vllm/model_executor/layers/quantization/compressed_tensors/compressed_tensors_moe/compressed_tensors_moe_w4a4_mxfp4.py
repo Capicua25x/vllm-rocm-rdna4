@@ -49,18 +49,18 @@ logger = init_logger(__name__)
 
 @cache
 def _on_rdna4_with_triton_graft() -> bool:
-    """gfx1200 / gfx1201 con el injerto RDNA de triton_kernels COMPLETO.
+    """gfx1200 / gfx1201 with the COMPLETE RDNA graft of triton_kernels.
 
-    Deliberadamente `on_rdna4()` y no el `on_gfx1x()` del parche 0.19.1:
-    `on_gfx1x()` también admite gfx11 (RDNA3), donde la rama RDNA4 de
-    `opt_flags` del injerto nunca dispara y este camino no se ha probado.
-    Mismo criterio que `kernels/linear/mxfp4/rdna.py`.
+    Deliberately `on_rdna4()` and not the 0.19.1 patch's `on_gfx1x()`:
+    `on_gfx1x()` also admits gfx11 (RDNA3), where the graft's RDNA4 branch of
+    `opt_flags` never fires and this path has not been tested. Same criterion
+    as `kernels/linear/mxfp4/rdna.py`.
 
-    Se comprueban los TRES símbolos del injerto, no sólo el layout: con
-    `RDNAMXValueLayout` presente pero `get_rdna_version_host` ausente,
-    `opt_flags` elegiría tiles CDNA/por-defecto (split_k, persistent) que la
-    rama RDNA_VALUE de `_matmul_ogs` nunca ha visto. Injerto parcial =
-    injerto ausente.
+    All THREE graft symbols are probed, not just the layout: with
+    `RDNAMXValueLayout` present but `get_rdna_version_host` absent,
+    `opt_flags` would pick CDNA/default tiles (split_k, persistent) that the
+    RDNA_VALUE branch of `_matmul_ogs` has never seen. A partial graft is
+    treated as no graft.
     """
     if not current_platform.is_rocm():
         return False
@@ -70,9 +70,9 @@ def _on_rdna4_with_triton_graft() -> bool:
     if not on_rdna4():
         return False
 
-    # OJO al orden: has_triton_kernels() *importa* el paquete (aliasea
-    # vllm.third_party.triton_kernels en sys.modules), así que tiene que
-    # correr ANTES de cualquier `from triton_kernels...`.
+    # Order matters: has_triton_kernels() *imports* the package (aliasing
+    # vllm.third_party.triton_kernels into sys.modules), so it has to run
+    # BEFORE any `from triton_kernels...`.
     from vllm.utils.import_utils import has_triton_kernels
 
     if not has_triton_kernels():
@@ -93,13 +93,13 @@ def _on_rdna4_with_triton_graft() -> bool:
 
     return True
 
-    # TODO(rdna4-mxfp4-moe): esta comprobación duplica
-    # `_has_rdna_mxfp4_graft()` de
-    # `vllm/model_executor/kernels/linear/mxfp4/rdna.py`. NO se importa de allí
-    # a propósito: ese módulo llama a `direct_register_custom_op` en el import
-    # (registra torch.ops.vllm.rdna_mxfp4_gemm), y la ruta MoE no debe arrastrar
-    # ese efecto global. Si el fichero denso se fusiona, mover el helper a un
-    # sitio compartido y borrar esta copia.
+    # TODO(rdna4-mxfp4-moe): this probe duplicates
+    # `_has_rdna_mxfp4_graft()` in
+    # `vllm/model_executor/kernels/linear/mxfp4/rdna.py`. It is NOT imported
+    # from there on purpose: that module calls `direct_register_custom_op` at
+    # import time (registering torch.ops.vllm.rdna_mxfp4_gemm), and the MoE
+    # path must not drag in that global side effect. If the dense file is ever
+    # merged upstream, move the helper somewhere shared and delete this copy.
 
 
 class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
@@ -135,14 +135,14 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 UnfusedOAITritonExperts,
             )
 
-            # Esta clase fija experts_cls A MANO, sin pasar por
-            # `is_supported_config` del oráculo (igual que ya hace con Marlin).
-            # El assert es la red: si upstream estrecha el gate de dispositivo,
-            # esto falla RUIDOSAMENTE en vez de correr una clase que se
-            # considera a sí misma no soportada.
+            # This sets experts_cls BY HAND, without going through the
+            # oracle's `is_supported_config` (exactly as done for Marlin).
+            # The assert is the safety net: if upstream narrows the device
+            # gate, this fails LOUDLY instead of running a class that
+            # considers itself unsupported.
             assert UnfusedOAITritonExperts._supports_current_device(), (
-                "UnfusedOAITritonExperts no admite este dispositivo pese a "
-                "on_rdna4() + injerto RDNA presente"
+                "UnfusedOAITritonExperts does not support this device despite "
+                "on_rdna4() + the RDNA graft being present"
             )
 
             self.mxfp4_backend = Mxfp4MoeBackend.TRITON_UNFUSED
@@ -151,20 +151,20 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 "Using UnfusedOAITritonExperts for MXFP4 MoE on RDNA4 "
                 "(no Marlin kernel on gfx12xx)"
             )
-            # TODO(rdna4-mxfp4-moe): el parche 0.19.1 del operador EVITABA
-            # `UnfusedOAITritonExperts` porque su gather torch crudo
-            # (`intermediate_cache1.view(-1, N)[gather_indx.dst_indx]`, hoy en
-            # gpt_oss_triton_kernels_moe.py:1217) se salía de rango con routing
-            # ragged, y prefería `OAITritonMxfp4ExpertsMonolithic` con la
-            # activación desfusionada a mano. En 0.26.1 esa clase monolítica
-            # exige SWIGLUOAI (gpt_oss_triton_kernels_moe.py:1326) y
-            # `triton_kernel_fused_experts` sigue con
-            # `assert activation == MoEActivation.SWIGLUOAI` (línea 650);
-            # Ornith es SILU, así que esa ruta no se puede mapear sin rehacer
-            # el hunk #1 entero. La ruta unfused SÍ se reescribió aguas arriba
-            # (remap_topk_to_local, masked_moe_sum, centinela -1), pero NO se ha
-            # verificado que el OOB de 0.19.1 esté cerrado. Verificar con topk
-            # ragged / EP antes de promocionar a producción.
+            # TODO(rdna4-mxfp4-moe): this project's earlier 0.19.1 patch
+            # AVOIDED `UnfusedOAITritonExperts` because its raw torch gather
+            # (`intermediate_cache1.view(-1, N)[gather_indx.dst_indx]`, now at
+            # gpt_oss_triton_kernels_moe.py:1217) went out of range with
+            # ragged routing, preferring `OAITritonMxfp4ExpertsMonolithic`
+            # with the activation defused by hand. In 0.26.1 that monolithic
+            # class requires SWIGLUOAI (gpt_oss_triton_kernels_moe.py:1326)
+            # and `triton_kernel_fused_experts` still asserts
+            # `activation == MoEActivation.SWIGLUOAI` (line 650); Ornith is
+            # SILU, so that route cannot be mapped without redoing the whole
+            # original hunk #1. The unfused route WAS rewritten upstream
+            # (remap_topk_to_local, masked_moe_sum, -1 sentinel), but the
+            # 0.19.1 OOB has NOT been re-verified as closed. Verify with
+            # ragged topk / EP before promoting to production use.
         else:
             logger.info_once("Using MarlinExperts for MXFP4 MoE")
             self.experts_cls = MarlinExperts
@@ -247,9 +247,9 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 w2_scale=layer.w2_weight_scale,
             )
         elif self.use_rdna4_triton:
-            # TRITON_UNFUSED: `convert_weight_to_mxfp4_moe_kernel_format` ya
-            # borró layer.w13/w2_weight_scale; las escalas swizzleadas viven
-            # dentro de los PrecisionConfig. Idéntico a Mxfp4MoEMethod.
+            # TRITON_UNFUSED: `convert_weight_to_mxfp4_moe_kernel_format`
+            # already deleted layer.w13/w2_weight_scale; the swizzled scales
+            # live inside the PrecisionConfigs. Identical to Mxfp4MoEMethod.
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
             return make_mxfp4_moe_quant_config(
@@ -312,21 +312,22 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         elif current_platform.is_xpu():
             pass
         elif self.use_rdna4_triton:
-            # RDNA4: NO `prepare_moe_fp4_layer_for_marlin` — su
-            # `_repack_marlin_experts` llama a `ops.gptq_marlin_repack`, que en
-            # ROCm no existe en `torch.ops._C`. En su lugar, la misma conversión
-            # que usa Mxfp4MoEMethod para los backends TRITON_*: `_swizzle_mxfp4`
-            # envuelve pesos y escalas en tensores de triton_kernels y devuelve
-            # PrecisionConfigs. Los pesos siguen empaquetados a 4 bits; el
-            # dequant ocurre dentro del GEMM (`mxfp4_dequant_rdna`).
+            # RDNA4: NOT `prepare_moe_fp4_layer_for_marlin` — its
+            # `_repack_marlin_experts` calls `ops.gptq_marlin_repack`, which
+            # does not exist in `torch.ops._C` on ROCm. Instead, the same
+            # conversion Mxfp4MoEMethod uses for the TRITON_* backends:
+            # `_swizzle_mxfp4` wraps weights and scales in triton_kernels
+            # tensors and returns PrecisionConfigs. Weights stay packed at 4
+            # bits; dequant happens inside the GEMM (`mxfp4_dequant_rdna`).
             #
-            # `convert_weight_to_mxfp4_moe_kernel_format` hace `del` de
-            # layer.w13/w2_weight y de layer.w13/w2_weight_scale, así que hay que
-            # volver a asignar los pesos como atributos planos (los tensores de
-            # triton_kernels no son nn.Parameter y no soportan .detach()).
+            # `convert_weight_to_mxfp4_moe_kernel_format` does `del` on
+            # layer.w13/w2_weight and layer.w13/w2_weight_scale, so the
+            # weights must be re-assigned as plain attributes (triton_kernels
+            # tensors are not nn.Parameter and do not support .detach()).
             #
-            # Este método no crea sesgos MoE, así que w13_bias/w2_bias son None y
-            # la rama TRITON_UNFUSED de la conversión los deja pasar intactos.
+            # This method creates no MoE biases, so w13_bias/w2_bias are None
+            # and the TRITON_UNFUSED branch of the conversion passes them
+            # through untouched.
             w13, w2, w13_precision, w2_precision, _, _ = (
                 convert_weight_to_mxfp4_moe_kernel_format(
                     mxfp4_backend=self.mxfp4_backend,

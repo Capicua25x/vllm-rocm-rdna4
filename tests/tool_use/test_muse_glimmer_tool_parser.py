@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit test the MuseGlimmer ATEM tool parser against realistic model output."""
 import json
 

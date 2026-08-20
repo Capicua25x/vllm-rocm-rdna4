@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """parse_delta-level regression tests for the MuseGlimmer parsers.
 
 These drive the UNIFIED parser-engine streaming API the serving layer actually

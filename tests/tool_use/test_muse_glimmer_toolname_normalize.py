@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MuseGlimmer tool-name normalization: collapse model-synthesized namespaces to the
 client-registered tool name (so bare-named tools bind).
 

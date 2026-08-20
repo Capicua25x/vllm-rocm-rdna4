@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Streaming + truncation regression tests for the MuseGlimmer parsers.
 
 Covers the streaming-mode defects fixed in

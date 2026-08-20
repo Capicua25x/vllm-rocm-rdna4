@@ -1,7 +1,13 @@
 # vLLM 0.26.1 — RDNA4 port (gfx1200/gfx1201: Radeon AI PRO R9700, RX 9070 XT)
 
-Branch `rdna4-port-0.26.1` = upstream vLLM 0.26.1 + the changes needed to serve well on AMD
-RDNA4 consumer/workstation GPUs, which are outside the official ROCm vLLM targets (gfx90a/942/950).
+Branch `rdna4-port-0.26.1` = upstream vLLM (0.26.1 line, base commit `99e62b802`) + the changes needed
+to serve well on AMD RDNA4 consumer/workstation GPUs, which are outside the official ROCm vLLM targets
+(gfx90a/942/950).
+
+**Carriable fixes, each its own branch:** `fix/suppress-stops-in-reasoning` (detokenizer guard +
+CPU test — vllm-project/vllm#53066) · `fix/unified-attn-3d-smallq` (3D split-KV gate for spec-decode
+verify shapes) · `feat/rdna4-mxfp4-linear` (MXFP4 dense/MoE path). Anyone may carry them upstream;
+authorship preservation appreciated.
 
 ## Attribution and lineage
 
@@ -490,10 +496,11 @@ five (0 leaks, 0 over-exclusion), but none has been loaded in vLLM: throughput, 
 paths, Ornith's grafted-MTP acceptance rate and even whether the loader accepts the bare `mtp.*` exclude
 names are all **unverified**.
 
-**Weights release:** the 27B build is being prepared for publication under `Capicua25x/` on Hugging Face
-with a model card carrying its base licence, attribution and statement of modification. Nothing is public
-at the time of writing. The five unserved builds are not release candidates yet — some have open base
-licence questions and none has serving evidence.
+**Weights release:** the 27B Quark MXFP4 build is published:
+[`Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4`](https://huggingface.co/Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4)
+(model card carries the base licence, attribution, statement of modification, and the measured
+accuracy/throughput tables). The five unserved builds remain unreleased — some have open base-licence
+questions and none has serving evidence.
 
 ## Not here
 No PRs upstream by choice — the branch is carried on this fork (patches are separable:
