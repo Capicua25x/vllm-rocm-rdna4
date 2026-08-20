@@ -356,6 +356,15 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
   and 32 actually-running requests (fair-cell c32 aggregate 228 → 319 tok/s). On a page-rich config it
   buys little and can cost single-stream speed — measure per config; gate accuracy (the checkpoint asks
   for fp32 state; our gates: GSM8K ×3 and a 100-item long-context-reasoning set stayed in band).
+* **Tuned per-shape w8a8 block-fp8 GEMM configs are worth +7-18% end-to-end on gfx1201** — vLLM ships
+  no `AMD_Radeon_R9700` entries in `quantization/utils/configs/`, so every dense fp8 GEMM runs on
+  default tile heuristics. Community-tuned configs (credit: **andysalerno** and **prcoe1**, whose
+  [r9700-serving](https://github.com/andysalerno/R9700-serving) /
+  [fork](https://github.com/prcoe1/r9700-serving) benchmarks surfaced the lever and its magnitude)
+  measured on our serve: c1 +7%, c16 +18%, c32 +13%, accuracy gates unchanged (GSM8K, 166-test
+  regression suite). Their repos carry no license, so their JSONs are not redistributed here; we will
+  publish our own configs regenerated with vLLM's tuner (`benchmarks/kernels/benchmark_moe.py --tune`
+  and the w8a8 equivalent) in a future release.
 * **Do NOT enable vLLM's custom all-reduce on gfx12/PCIe** (`use_custom_allreduce` is vendor-gated to
   gfx94/95 for a reason): it initializes and returns garbage on this pair.
 
