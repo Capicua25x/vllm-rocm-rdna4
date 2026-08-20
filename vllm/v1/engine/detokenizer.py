@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from abc import ABC, abstractmethod
 
@@ -60,10 +61,58 @@ class IncrementalDetokenizer:
 
         if USE_FAST_DETOKENIZER and isinstance(tokenizer, TokenizersBackend):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            return FastIncrementalDetokenizer(tokenizer, request)
+            detok: IncrementalDetokenizer = FastIncrementalDetokenizer(
+                tokenizer, request)
+        else:
+            # Fall back to slow python-based incremental detokenization.
+            detok = SlowIncrementalDetokenizer(tokenizer, request)
+        IncrementalDetokenizer._maybe_enable_reasoning_guard(
+            detok, tokenizer, request)
+        return detok
 
-        # Fall back to slow python-based incremental detokenization.
-        return SlowIncrementalDetokenizer(tokenizer, request)
+    @staticmethod
+    def _reasoning_markers() -> tuple[str, str]:
+        # PATCH(stop-in-reasoning): prefer the deployment's own
+        # --reasoning-config over hardcoded markers, so the guard is general
+        # rather than DeepSeek-specific. Falls back to the common defaults.
+        start, end = "<think>", "</think>"
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+
+            cfg = get_current_vllm_config_or_none()
+            rc = getattr(cfg, "reasoning_config", None) if cfg else None
+            if rc is not None:
+                start = getattr(rc, "reasoning_start_str", "") or start
+                end = getattr(rc, "reasoning_end_str", "") or end
+        except Exception as e:
+            logger.debug(
+                "stop-in-reasoning: no reasoning config (%s); using %r / %r",
+                e, start, end)
+        return start, end
+
+    @staticmethod
+    def _maybe_enable_reasoning_guard(detok, tokenizer, request) -> None:
+        # PATCH(stop-in-reasoning): see BaseIncrementalDetokenizer.__init__.
+        # NOTE: this opt-out is process-wide, not per-request. A caller who
+        # deliberately wants to bound reasoning with a stop string has no
+        # escape hatch short of restarting with it set to 0.
+        if os.environ.get("VLLM_SUPPRESS_STOPS_IN_REASONING", "1") == "0":
+            return
+        try:
+            stop = getattr(detok, "stop", None)
+            ptids = getattr(request, "prompt_token_ids", None)
+            if not stop or not ptids:
+                return
+            start_str, end_str = IncrementalDetokenizer._reasoning_markers()
+            think_id = tokenizer.convert_tokens_to_ids(start_str)
+            if think_id is not None and think_id >= 0 and ptids[-1] == think_id:
+                detok._reasoning_stop_guard = True
+                detok._reasoning_end_str = end_str
+        except Exception as e:
+            # Never swallow silently: a renamed attribute would turn this fix
+            # into a no-op, and that failure mode looks exactly like "the
+            # patch is not installed".
+            logger.debug("stop-in-reasoning: guard not armed (%s)", e)
 
 
 class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
@@ -89,6 +138,16 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         else:
             self.stop_buffer_length = 0
         self._last_output_text_offset: int = 0
+
+        # PATCH(stop-in-reasoning): when the prompt ends with the reasoning
+        # opening token (prompt-side <think>, as DeepSeek-V4/Qwen3 templates
+        # do), client stop strings must not match inside the reasoning segment
+        # -- matching there truncates mid-think and yields content=None. Stops
+        # stay dormant until the reasoning end marker appears in the output.
+        # Disable with VLLM_SUPPRESS_STOPS_IN_REASONING=0 (process-wide).
+        self._reasoning_stop_guard: bool = False
+        self._reasoning_closed: bool = False
+        self._reasoning_end_str: str = "</think>"
 
         # Generation data
         self.output_text = ""
@@ -127,8 +186,24 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             self.token_ids.append(skipped_stop_token_id)
 
         # 2) Evaluate stop strings.
+        # PATCH(stop-in-reasoning): keep stops dormant while reasoning is open.
+        if self._reasoning_stop_guard and not self._reasoning_closed:
+            marker = self._reasoning_end_str
+            window = max(0, stop_check_offset - (len(marker) - 1))
+            idx = self.output_text.find(marker, window)
+            if idx != -1:
+                self._reasoning_closed = True
+                # Only evaluate stops over what FOLLOWS the marker. With
+                # speculative decoding this same update() carries up to k+1
+                # tokens, so the reasoning that preceded the close arrives in
+                # this very chunk and must not be able to fire a stop.
+                stop_check_offset = max(stop_check_offset, idx + len(marker))
         stop_string = None
-        if self.stop and self.num_output_tokens() > self.min_tokens:
+        if (
+            self.stop
+            and self.num_output_tokens() > self.min_tokens
+            and (not self._reasoning_stop_guard or self._reasoning_closed)
+        ):
             stop = check_stop_strings(
                 output_text=self.output_text,
                 new_char_count=len(self.output_text) - stop_check_offset,
