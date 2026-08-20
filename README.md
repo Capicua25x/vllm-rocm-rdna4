@@ -31,6 +31,11 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 > **⚡ 2026-08-20 — major performance upgrade (rc10):** tuned per-shape GEMM configs for the R9700
 > (regenerated with vLLM's own tuner) ship in-tree. Short-prompt c32 aggregate: FP8 arm **754 → 1,014
 > tok/s (+34%)**, MXFP4 arm **579 → 713 (+23%)**; every cell improved. Image: `capicua25x/vllm-rocm-rdna4:latest`.
+> Credit where due: this port was always geared to **concurrent serving** (32 sequences, speculative
+> decoding, accuracy-gated) — the single-stream tuning insight came from the community:
+> [andysalerno](https://github.com/andysalerno/R9700-serving)'s and
+> [prcoe1](https://github.com/prcoe1/r9700-serving)'s benchmarks surfaced the untuned-GEMM gap; folding
+> that lever into the concurrency stack closed the loop.
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 
