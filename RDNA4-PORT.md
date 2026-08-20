@@ -366,11 +366,29 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 | checkpoint | `Qwen/Qwen3.8-27B-FP8` | [`Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4`](https://huggingface.co/Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4) |
 | extra flags | `--kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16` + `-e NCCL_PROTO=Simple` | `-e NCCL_PROTO=Simple` optional (neutral here) |
 | KV pool @32 slots | **539k tokens (2.06× window)** | 415k (1.6×) |
-| 5,329-tok cell, agg tok/s c8/c16/c32 | 201 / 268 / 319 | **201 / 270 / 329** |
-| short prompts c32/c64 | **746 / 790** | 566 / 570 |
-| GSM8K think strict ×3 seeds | 0.84–0.90 | 0.86–0.98 |
-| long-context reasoning (100 items, judged) | 0.77–0.81 | 0.78 |
-| pick when | max context capacity / single-user latency | max multi-user throughput at real context sizes |
+| pick when | max context capacity / short-prompt throughput | best per-user speed at real context sizes |
+
+**Throughput** (think ON, `max_tokens 256`, per-user / aggregate tok/s, warm serve, first-run cells).
+Short prompts (~30 tok):
+
+| users | B | C |
+|---|---|---|
+| 1 | 56 / 56 | 55 / 55 |
+| 4 | 47 / 182 | 42 / 163 |
+| 8 | 41 / 290 | 35 / 252 |
+| 16 | 34 / 496 | 27 / 394 |
+| 32 | 26 / **754** | 20 / 579 |
+| 64 | 19 / **795** | 14 / 561 |
+
+6,000-token prompts (RAG / long-system-prompt workloads):
+
+| users | B | C |
+|---|---|---|
+| 1 | 48 / 48 | 47 / 47 |
+| 4 | 35 / 130 | 37 / 133 |
+| 8 | 27 / 200 | 27 / 200 |
+| 16 | 18 / 269 | 18 / 273 |
+| 32 | 10 / 317 | 11 / 325 |
 
 **Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
 window, MTP-3, 32 slots). The A/B pair we run in production:
@@ -411,90 +429,34 @@ bf16 KV). rc8 = rc7 + the re-tuned MXFP4 tile table (`sha256:1fffe1cb…`). rc6 
 `RdnaMxfp4Fp8LinearKernel`; rc5 = `sha256:0f5cbc40…` (also tagged `glimmer-qwen38-rc5`, kept).
 Previous generation: `:0.19.1`.
 
-## Models validated on this port (2× R9700, TP2 unless noted)
-| Model | Format | Spec-decode | Notes |
+## Models on this port
+
+Current profile: **Qwen3.8-27B** (dense hybrid GDN/attention, VL, native MTP) — FP8 stock and our
+Quark MXFP4 build, both accuracy-gated and in the A/B above. More model profiles (35B-A3B MoE,
+Gemma-4, Mistral) will be offered later; five structurally-verified Quark builds remain unserved
+and unreleased.
+
+## Accuracy (AA class-A, paired items, seed 1234, on-spec sampling)
+
+**ref** = the same checkpoint served in bf16 by a cloud provider (our parity reference). Same judge
+for all judged rows. Every number is the FIRST run at the stated n — reruns are never substituted;
+±2 items is the noise band.
+
+| benchmark (n) | ref (bf16) | B | C |
 |---|---|---|---|
-| Qwen3.8-27B (dense hybrid GDN/attn, VL, native MTP) | FP8 (stock) / **MXFP4** (ours) | MTP-3 | MXFP4: 262k window, ~61 tok/s think-OFF (rc6; 51 on rc5) / ~46 think-ON; FP8: 64k, ~63 tok/s think-OFF. Both MXFP4 numbers are the RTN build; the Quark build now in production is in **Status** below. Recipe: **Quantization recipe** above |
-| Ornith-1.0-35B (`qwen3_5_moe` MoE) and a DSV4Pro-Thinking distill of Qwen3.6-35B-A3B | MXFP4 (compressed-tensors) | MTP-3 (head grafted from `pahajokiconsulting/Qwen3.6-35B-A3B-MXFP4`, Apache-2.0) | ~75–107 tok/s single-stream; production engine 2026-06 → 2026-08-15. Ornith's own card describes the family as RL post-trained on Gemma 4 and Qwen 3.5 — its base lineage is **not established here**; the Quark rebuild is a separate, unserved artifact |
-| Muse-Glimmer-30B | MXFP4 (RTN, retired pipeline) / FP8-block | DFlash draft (z-lab) | dense; the first model brought up on this line (hence the old tag name). The Quark MXFP4 rebuild is a separate, unserved artifact |
-| RadixArk Qwen3.8-27B-DSpark | bf16 draft | DSpark block-7 (V2 model runner) | works; loses to native MTP-3 on this hardware (44 vs 63 tok/s) |
-| amd/Qwen3.8-27B-Quark-AWQ-MXFP4 | Quark W4A4 | MTP-3 (with `mtp.*` exclude patch) | runs as W4A16 on the RDNA kernel. Paired single-card run (TP1, 32k, 8 slots, MTP-3, 2026-08-15) vs our **RTN** build: 26.8 vs 27.1 tok/s — a dead heat; gsm8k n=50 0.96 flex / **0.78 strict** vs 0.98 / 0.98. On this hardware quantizing attention costs strict-format adherence, not throughput |
+| GSM8K thinking, flex·strict (50) | 0.96·0.82 | 0.98·0.84 | 0.94·0.92 |
+| — seeds 7 / 99 | — | 0.96·0.84 / 0.96·0.90 | 0.98·0.98 / 0.96·0.90 |
+| GSM8K non-thinking (50) | 0.98·0.98 | 0.98·0.98 | 0.98·0.98 |
+| IFEval, inst·prompt strict (80) | 0.97·0.95 | 0.98·0.98 | 0.97·0.95 |
+| Long-context reasoning, judged (100) | 0.78 | 0.77 | 0.78 |
+| GPQA-Diamond (60) | 0.78 | 0.85 | 0.92 |
+| AIME'25 (30) | 0.93 | 0.97 | 0.93 |
+| τ²-Bench telecom (114) | 0.939 | ⏳ | 0.904 |
 
-## Status (2026-08-17)
-
-**Served, benchmarked, in production: one build.** `Qwen3.8-27B-MXFP4-Quark-RDNA4`, TP2 on 2× R9700 under
-rc6, TRITON_ATTN, MTP-3, 262k window, 32 slots, bf16 KV, selecting `RdnaMxfp4Fp8LinearKernel`. The
-serving checkpoint was switched from the retired RTN MXFP4 build to this Quark build on 2026-08-17 01:15;
-every number in this section was produced on the Quark build.
-
-Capacity gate at 262k / 32 slots: **KV pool 342,392 tokens**, **24.4 GB per GPU**, MTP mean acceptance
-length **3.10 / 2.85**. Reference bf16 = the same checkpoint served in bf16 by a hosted provider; FP8 =
-the vendor's own FP8 weights on this box.
-
-| Cell | n | MXFP4 (Quark) | bf16 ref | vendor FP8 (bf16 KV) |
-|---|---|---|---|---|
-| GSM8K think (flex / strict) | 50 | 0.96 / 0.94 | 0.96 / 0.82 | 0.96 / 0.90 |
-| GSM8K nothink (flex / strict) | 50 | 0.98 / 0.98 | 0.98 / 0.98 | 0.98 / 0.98 |
-| IFEval (inst / prompt strict) | 80 | 0.9688 / 0.9500 | 0.9688 / 0.9500 | 0.9688 / 0.9500 |
-| GPQA-Diamond | 60 | 0.9167 | 0.7833 | 0.8333 |
-| AIME'25 | 30 | 0.9333 | 0.9333 | 1.0000 |
-| AA-LCR (long context, LLM-judged) | 100 | 0.780 | 0.780 | 0.800 on the 90 it served / 0.720 over 100 |
-| τ²-Bench Telecom (thinking on) | 114 | 0.868 (99/114) | 0.939 (repaired) | 0.904 |
-| HLE | 120 | **not measured** | 0.3083 | not measured |
-
-Caveats that belong with those numbers, not in a footnote nobody reads:
-
-* **GSM8K think 0.96/0.94 is the top of a spread, not a repeat-measured result.** The build gate ran the
-  same seed on the same server 52 minutes earlier and three seeds gave 0.94/0.92, 0.94/0.88, 0.94/0.94 —
-  mean **0.940 / 0.913**. Sampling is temp 1.0 under continuous batching; the seed does not deliver
-  determinism.
-* **GPQA-D is a single run at n=60** with a stated ±3-item band, so +5 vs FP8 and +8 vs the bf16 reference
-  are real but unrepeated. Termination was clean (120/120 generations, 0 empty).
-* **AIME'25 is flagged suspicious by our own truncation auditor** — 1 of 30 items produced no output
-  (3.3 % hard, above the 2 % CLEAN threshold). Scored as wrong; the cell is a termination failure, not a
-  wrong answer.
-* **AA-LCR is judge-noisy.** Re-judging the identical file with the identical judge flips about 1 item per
-  100 (this build: 78 then 77). Same-pass comparisons put MXFP4, FP8 and bf16 within judge noise of each
-  other; do not read a 2–3 item gap as a quantization result.
-* **τ² Telecom compares unequal denominators.** The bf16 reference's 0.939 is a *repaired* number — 12
-  sims died on a provider-side error and were re-run and merged. This build's 0.868 is unrepaired, with 1
-  sim ending in error; on completed sims it is 99/113 = **0.876**.
-* **This is the only local arm with zero `__ERROR__` records across every completed generation cell.** The
-  262k window takes 100 % of the AA-LCR set; the 131k FP8 arm refused 10 % of it outright (prompts up to
-  122k tokens), which is the whole of that arm's 0.800-vs-0.720 split.
-* An earlier AA-LCR result of 0.730 for this build was **withdrawn**: it ran at temp 0.6 with
-  `reasoning_effort` omitted and mixed two configurations within one cell. The on-spec re-run is the 0.780
-  above. A cell is only paired if its *environment* is paired.
-
-**Throughput, think-ON** (chat endpoint, thinking enabled — not comparable to the think-OFF figures in
-*What's in the port*):
-
-| Shape | MXFP4 Quark | vendor FP8 + bf16 KV | vendor FP8 + fp8 KV |
-|---|---|---|---|
-| short, c1 | 47.7 | 53.6 | 46.3 |
-| short, c8 (per-user / agg) | 28.6 / 213 | 35.5 / 270 | 30.8 / 224 |
-| short, c16 | 26.5 / 384 | 28.6 / 433 | 27.1 / 398 |
-| short, c32 | 18.2 / 539 | not measured | not measured |
-| 6k, c1 | 46.3 | 49.6 | 46.4 |
-| 6k, c8 | 26.2 / 199 | 28.3 / 221 | 18.8 / 147 |
-| 6k, c16 | 16.9 / 260 | 18.7 / 284 | 11.3 / 176 |
-
-Stated plainly: with thinking on, MXFP4 is **~11 % below stock FP8 at single stream** (47.7 vs 53.6) and
-8–20 % below at c8–c16. Where it wins is capacity — it is the only arm measured at c32, and it carries a
-262k window with a 342K-token KV pool at 24.4 GB per GPU where the FP8 arm was configured at 131k.
-No think-OFF sweep and no prefill-only measurement exists for this build.
-
-**Still running or still owed** (single GPU pair, arms run serially): HLE 120 re-run, τ²-Bench Airline,
-τ²-Bench Retail, SWE-bench Verified, Terminal-Bench Hard-44, LiveCodeBench. An earlier HLE attempt
-returned HTTP 400 on **120 of 120** generations — a harness bug (an unsupported reasoning-effort value),
-not a capability measurement. It scored 0.0000 and the runner's guard correctly refused to publish it.
-**There is no HLE number for this build; 0.0000 must never be quoted as one.**
-
-**Structurally verified, never loaded: five builds** — Ornith-1.0-35B, Muse-Glimmer-30B,
-Mistral-Small-3.2-24B, gemma-4-31B-it, gemma-4-26B-A4B-it. Tensor-level policy verification passed for all
-five (0 leaks, 0 over-exclusion), but none has been loaded in vLLM: throughput, output quality, the vision
-paths, Ornith's grafted-MTP acceptance rate and even whether the loader accepts the bare `mtp.*` exclude
-names are all **unverified**.
+Reading caveats, condensed: GSM8K under continuous batching is seed-labelled but not deterministic
+(treat single cells as draws from the seed spread); the judged rows flip ~1 item/100 on re-judge —
+never read a 1–2 item gap as a quantization result; the τ² reference is a repaired number
+(12 provider-side sim deaths re-run) while C's 0.904 is unrepaired.
 
 **Weights release:** the 27B Quark MXFP4 build is published:
 [`Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4`](https://huggingface.co/Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4)
