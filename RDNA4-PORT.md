@@ -365,37 +365,34 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 | long-context reasoning (100 items, judged) | 0.77–0.81 | 0.78 |
 | pick when | max context capacity / single-user latency | max multi-user throughput at real context sizes |
 
-**Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k window,
-MTP-3, 32 slots). **Supported configurations: C and D.** The FP8-checkpoint configuration (B) is still under
-validation on our side — its flags are in the table above and we will publish the full command once our
-complete gate battery lands; run it at your own risk meanwhile.
+**Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
+window, MTP-3, 32 slots). The A/B pair we run in production:
 
 ```bash
-# C · MXFP4 (Quark) + bf16 KV — max multi-user throughput at real context sizes (fully gated)
+# Quick start B · FP8 @ fp8 KV — max context capacity (KV pool ≈ 2× the 262k window)
 docker run --rm --name vllm-qwen --network=host \
   --device=/dev/kfd --device=/dev/dri/renderD128 --device=/dev/dri/renderD129 \
   --group-add=video --group-add=render --ipc=host \
   -e NCCL_PROTO=Simple \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --entrypoint /usr/local/bin/vllm capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc9 \
-  serve Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4 --served-model-name qwen --port 8011 --trust-remote-code \
+  serve Qwen/Qwen3.8-27B-FP8 --served-model-name qwen --port 8011 --trust-remote-code \
   --tensor-parallel-size 2 --gpu-memory-utilization 0.95 --max-model-len 262144 \
   --attention-backend TRITON_ATTN --enable-prefix-caching \
   --max-num-seqs 32 --max-num-batched-tokens 8000 --max-cudagraph-capture-size 128 \
+  --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 \
   --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
 
-# D · MXFP4 (Quark) + fp8 KV — the largest KV pool we have measured (≈ 3.11× the 262k window;
-# accuracy gates in progress — treat as experimental for quality-sensitive workloads)
-#   = the C command plus:  --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16
+# Quick start C · MXFP4 @ bf16 KV — max multi-user throughput at real context sizes
+#   = the same command with:  serve Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4
+#     and WITHOUT:            --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16
 ```
 
-The rc9 env knobs (`VLLM_RDNA_HW_FP8CVT=1`, `VLLM_RDNA_P_SCALE=256`) are the defaults; both are inert on
-C's bf16-KV path and active on D's fp8-KV path. On fp8-KV configs the checkpoint ships no KV-cache scale
-tensors (scale 1.0; our amax survey peaked at 147 vs e4m3's 448, so nothing clips).
-
-**D in numbers**: pool **814,943 tokens = 3.11× the window**, best short-prompt aggregate (629 @c32),
-−8…−16 % vs C on the block-aligned cell. Use it for 100k-token-class workloads.
+rc9's env knobs (`VLLM_RDNA_HW_FP8CVT=1`, `VLLM_RDNA_P_SCALE=256`) are the defaults — active on B's
+fp8-KV path, inert on C's bf16-KV path; set to `0`/`1` respectively only to A/B against upstream
+behavior. On B, the checkpoint ships no KV-cache scale tensors (scale 1.0; our amax survey peaked at
+147 vs e4m3's 448, so nothing clips).
 
 So far Qwen3.8-27B behaves correctly on both A/B configurations under production traffic and the
 gates above; we will fold the verdict back here when the A/B concludes.

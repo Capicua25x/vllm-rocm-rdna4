@@ -1,9 +1,8 @@
 > ## ⚡ This fork: vLLM 0.26.1 ported to AMD RDNA4 (gfx1200/gfx1201 — Radeon AI PRO R9700, RX 9070 XT)
 > **Start here → [RDNA4-PORT.md](RDNA4-PORT.md)** — what's ported, release notes (current: **rc9**, 2026-08-19),
-> and **copy-paste serve commands** for the supported Qwen3.8-27B configurations:
-> **MXFP4 + bf16 KV** (max multi-user throughput, fully gated) · **MXFP4 + fp8 KV** (largest KV pool, ≈ 3.1× the
-> 262k window). An FP8-checkpoint + fp8 KV configuration is under validation and will follow.
-> Docker image: `capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc9` (= `:latest`).
+> and **two quick starts** for the Qwen3.8-27B configurations we A/B in production:
+> **FP8 @ fp8 KV** (max context capacity, KV pool ≈ 2× the 262k window) vs **MXFP4 @ bf16 KV**
+> (max multi-user throughput). Docker image: `capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc9` (= `:latest`).
 > Upstream README follows below.
 
 <!-- markdownlint-disable MD001 MD041 -->
