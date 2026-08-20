@@ -320,10 +320,64 @@ index (`du -sh` prints 21G). Base sizes are upstream bf16 index totals where a c
   (branch `fix/unified-attn-3d-smallq` carries this alone).
 - ROCm/gfx1201 build + container recipe (image below), FP8 via native FP8 WMMA.
 
+## Release rc9 (2026-08-19) — the serving-performance batch, and the two-config A/B
+
+Everything below is measured on 2× Radeon AI PRO R9700 (PCIe, TP2) serving Qwen3.8-27B at the full
+native 262,144-token window with MTP-3. Numbers are single-run cells from a fixed harness
+(`concurrency-bench.sh`, think ON, `max_tokens 256`); accuracy gates are paired items at on-spec sampling.
+
+**In the image/source (rc9 = rc8 + three attention-path changes, all env-gated):**
+* **Hardware fp8 converts on gfx12 without rebuilding Triton** — Triton 3.6.0 open-codes `f32↔e4m3fn`
+  (~33 VALU + 10 `s_wait_alu` per element) although gfx1201 has `v_cvt_pk_fp8_f32`. A plain-text LLVM-IR
+  extern library (`vllm/v1/attention/ops/rdnacvt.ll` + `rdna_cvt.py`, `tl.extern_elementwise`) emits the
+  hardware ops and returns real fp8 tensors: fp8-Q attention kernel −33 %, inner loop 1,568 → 814
+  instructions/iteration (= parity with the bf16-KV kernel), bit-identical outputs. Inert on bf16 KV.
+  `VLLM_RDNA_HW_FP8CVT=0` for A/B.
+* **`VLLM_RDNA_P_SCALE` (default 256)** — the software e4m3 downcast flushes softmax probabilities
+  ≤ 2⁻¹⁰ of the row max; a 2⁸ exponent shift (undone in the epilogue) lowers the floor to 2⁻¹⁸.
+  GSM8K strict on the fp8-KV config: 0.70 → 0.88. Inert on bf16 KV; `=1` restores upstream numerics.
+* `VLLM_RDNA_TILE_PREFILL` — measurement knob for the fp8-Q 2D kv-tile (default 32 = upstream).
+
+**Deployment findings you can use with ANY build (no code needed):**
+* **`NCCL_PROTO=Simple`** for TP2 over PCIe on this pair: RCCL picks the LL protocol for the ~640 KB
+  decode all-reduces and LL is 2.8× slower than Simple here (205 vs 73 µs/op). Served effect on the
+  FP8+fp8KV config: short-prompt c16 +17 %. Numerically identical. (Independently rediscovered by
+  r/LocalLLaMA as a deadlock workaround — same flag, same hardware.)
+* **`--mamba-ssm-cache-dtype bfloat16` is a CAPACITY lever for hybrid GDN models with spec-decode** —
+  in `align` mode every request reserves `groups × (2 + num_speculative_tokens)` SSM-state pages
+  regardless of length (15 pages/request here). On a page-poor config it is the difference between 22
+  and 32 actually-running requests (fair-cell c32 aggregate 228 → 319 tok/s). On a page-rich config it
+  buys little and can cost single-stream speed — measure per config; gate accuracy (the checkpoint asks
+  for fp32 state; our gates: GSM8K ×3 and a 100-item long-context-reasoning set stayed in band).
+* **Do NOT enable vLLM's custom all-reduce on gfx12/PCIe** (`use_custom_allreduce` is vendor-gated to
+  gfx94/95 for a reason): it initializes and returns garbage on this pair.
+
+**The two-config A/B we run in production (both pass the same gates; pick by workload):**
+
+| | **B · FP8 stock + fp8 KV** | **C · MXFP4 (Quark) + bf16 KV** |
+|---|---|---|
+| checkpoint | `Qwen/Qwen3.8-27B-FP8` | [`Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4`](https://huggingface.co/Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4) |
+| extra flags | `--kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16` + `-e NCCL_PROTO=Simple` | `-e NCCL_PROTO=Simple` optional (neutral here) |
+| KV pool @32 slots | **539k tokens (2.06× window)** | 415k (1.6×) |
+| 5,329-tok cell, agg tok/s c8/c16/c32 | 201 / 268 / 319 | **201 / 270 / 329** |
+| short prompts c32/c64 | **746 / 790** | 566 / 570 |
+| GSM8K think strict ×3 seeds | 0.84–0.90 | 0.86–0.98 |
+| long-context reasoning (100 items, judged) | 0.77–0.81 | 0.78 |
+| pick when | max context capacity / single-user latency | max multi-user throughput at real context sizes |
+
+There is also a **D config** — MXFP4 + fp8 KV + bf16 SSM state on rc9 — which combines C's weight
+bandwidth with the largest pool we have measured (**814,943 tokens = 3.11× the window**, best
+short-prompt aggregate 629 @c32, −8…−16 % vs C on the fair cell). Use it for 100k-token-class
+workloads; its accuracy gates are still running, so treat it as experimental.
+
+So far Qwen3.8-27B behaves correctly on both A/B configurations under production traffic and the
+gates above; we will fold the verdict back here when the A/B concludes.
+
 ## Image (Docker Hub)
-`capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc6` (digest `sha256:50701299…`; = `:0.26.1-rdna4` = `:latest`
-after the 2026-08-15 gate) — rc6 = rc5 + `RdnaMxfp4Fp8LinearKernel`. rc5 = `sha256:0f5cbc40…`
-(also tagged `glimmer-qwen38-rc5`, kept).
+`capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc9` (= `:0.26.1-rdna4` = `:latest` after the 2026-08-19
+gates) — rc9 = rc8 + hardware fp8 converts + `VLLM_RDNA_P_SCALE` + the prefill-tile knob (all inert on
+bf16 KV). rc8 = rc7 + the re-tuned MXFP4 tile table (`sha256:1fffe1cb…`). rc6 = rc5 +
+`RdnaMxfp4Fp8LinearKernel`; rc5 = `sha256:0f5cbc40…` (also tagged `glimmer-qwen38-rc5`, kept).
 Previous generation: `:0.19.1`.
 
 ## Models validated on this port (2× R9700, TP2 unless noted)
