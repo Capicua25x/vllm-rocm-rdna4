@@ -453,14 +453,14 @@ is the noise band.
 
 | benchmark (n) | ref (bf16) | B | C |
 |---|---|---|---|
-| GSM8K thinking, flex·strict (50) | 0.96·0.82 | 0.98·0.84 | 0.94·0.92 |
+| GSM8K think, flex·strict (50) | 0.96·0.82 | 0.98·0.84 | 0.94·0.92 |
 | — seeds 7 / 99 | — | 0.96·0.84 / 0.96·0.90 | 0.98·0.98 / 0.96·0.90 |
-| GSM8K non-thinking (50) | 0.98·0.98 | 0.98·0.98 | 0.98·0.98 |
-| IFEval, inst·prompt strict (80) | 0.97·0.95 | 0.98·0.98 | 0.95·0.91 |
-| Long-context reasoning, judged (100) | 0.78 | 0.81 | 0.78 |
+| GSM8K nothink (50) | 0.98·0.98 | 0.98·0.98 | 0.98·0.98 |
+| IFEval inst·prompt (80) | 0.97·0.95 | 0.98·0.98 | 0.95·0.91 |
+| AA-LCR judged (100) | 0.78 | 0.81 | 0.78 |
 | GPQA-Diamond (60) | 0.78 | 0.85 | 0.92 |
 | AIME'25 (30) | 0.93 | 0.97 | 0.93 |
-| τ²-Bench telecom (114) | 0.939 | ⏳ | 0.904 |
+| τ²-telecom (114) | 0.939 | ⏳ | 0.904 |
 
 Reading caveats, condensed: GSM8K under continuous batching is seed-labelled but not deterministic
 (treat single cells as draws from the seed spread); the judged rows flip ~1 item/100 on re-judge —
