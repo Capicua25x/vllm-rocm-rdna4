@@ -4,12 +4,6 @@ Branch `rdna4-port-0.26.1` = upstream vLLM (0.26.1 line, base commit `99e62b802`
 to serve well on AMD RDNA4 consumer/workstation GPUs, which are outside the official ROCm vLLM targets
 (gfx90a/942/950).
 
-**This repo's role (2026-08-20):** engine patches + the prebuilt image, feeding two places —
-upstream vLLM (issues + carriable branches below) and the community serving repo
-[Capicua25x/r9700-serving](https://github.com/Capicua25x/r9700-serving) (fork of
-[andysalerno/R9700-serving](https://github.com/andysalerno/R9700-serving)), where the deployment
-recipes and benchmark history now live. As upstream absorbs the patches, this repo shrinks.
-
 **Carriable fixes, each its own branch:** `fix/suppress-stops-in-reasoning` (detokenizer guard +
 CPU test — vllm-project/vllm#53066) · `fix/unified-attn-3d-smallq` (3D split-KV gate for spec-decode
 verify shapes) · `feat/rdna4-mxfp4-linear` (MXFP4 dense/MoE path). Anyone may carry them upstream;
