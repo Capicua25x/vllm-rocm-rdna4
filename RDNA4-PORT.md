@@ -439,15 +439,15 @@ and unreleased.
 ## Accuracy (AA class-A, paired items, seed 1234, on-spec sampling)
 
 **ref** = the same checkpoint served in bf16 by a cloud provider (our parity reference). Same judge
-for all judged rows. Every number is the FIRST run at the stated n — reruns are never substituted;
-±2 items is the noise band.
+for all judged rows. Cells show the most recent run at the stated n on the shipping config; ±2 items
+is the noise band.
 
 | benchmark (n) | ref (bf16) | B | C |
 |---|---|---|---|
 | GSM8K thinking, flex·strict (50) | 0.96·0.82 | 0.98·0.84 | 0.94·0.92 |
 | — seeds 7 / 99 | — | 0.96·0.84 / 0.96·0.90 | 0.98·0.98 / 0.96·0.90 |
 | GSM8K non-thinking (50) | 0.98·0.98 | 0.98·0.98 | 0.98·0.98 |
-| IFEval, inst·prompt strict (80) | 0.97·0.95 | 0.98·0.98 | 0.97·0.95 |
+| IFEval, inst·prompt strict (80) | 0.97·0.95 | 0.98·0.98 | 0.95·0.91 |
 | Long-context reasoning, judged (100) | 0.78 | 0.81 | 0.78 |
 | GPQA-Diamond (60) | 0.78 | 0.85 | 0.92 |
 | AIME'25 (30) | 0.93 | 0.97 | 0.93 |
