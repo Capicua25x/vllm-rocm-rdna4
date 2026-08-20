@@ -324,7 +324,8 @@ index (`du -sh` prints 21G). Base sizes are upstream bf16 index totals where a c
 
 Everything below is measured on 2× Radeon AI PRO R9700 (PCIe, TP2) serving Qwen3.8-27B at the full
 native 262,144-token window with MTP-3. Numbers are single-run cells from a fixed harness
-(`concurrency-bench.sh`, think ON, `max_tokens 256`); accuracy gates are paired items at on-spec sampling.
+(**[Capicua25x/modelbench](https://github.com/Capicua25x/modelbench)** — `concurrency-bench.sh`, think ON,
+`max_tokens 256`); accuracy gates are paired items at on-spec sampling, same repo.
 
 **In the image/source (rc9 = rc8 + three attention-path changes, all env-gated):**
 * **Hardware fp8 converts on gfx12 without rebuilding Triton** — Triton 3.6.0 open-codes `f32↔e4m3fn`
