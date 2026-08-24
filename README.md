@@ -36,6 +36,15 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 > [andysalerno](https://github.com/andysalerno/R9700-serving)'s and
 > [prcoe1](https://github.com/prcoe1/r9700-serving)'s benchmarks surfaced the untuned-GEMM gap; folding
 > that lever into the concurrency stack closed the loop.
+>
+> **2026-08-24 measurement update (bench v4):** the essay bench behind these absolutes reused one
+> fixed prompt, which lets the stateful spec-decode drafter partially replay earlier generations —
+> inflating absolute essay tok/s ~15–30%. The **relative** rc10 gains above were measured
+> like-for-like and **stand**; the absolute cells are replay-era. Honest v4 short-prompt c32
+> aggregate on the FP8 arm: **789 tok/s** (rotating topics + per-invocation nonce + temp 0.7 —
+> nothing is ever regenerated). Fixed in
+> [Capicua25x/modelbench](https://github.com/Capicua25x/modelbench) v4; full honest tables in
+> [RDNA4-PORT.md](RDNA4-PORT.md) under "Measurement update 2026-08-24".
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
 

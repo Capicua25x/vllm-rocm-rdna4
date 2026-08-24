@@ -12,6 +12,15 @@ to serve well on AMD RDNA4 consumer/workstation GPUs, which are outside the offi
 > [andysalerno](https://github.com/andysalerno/R9700-serving)'s and
 > [prcoe1](https://github.com/prcoe1/r9700-serving)'s benchmarks surfaced the untuned-GEMM gap; folding
 > that lever into the concurrency stack closed the loop.
+>
+> **2026-08-24 measurement update (bench v4):** the essay bench behind these absolutes reused one
+> fixed prompt, which lets the stateful spec-decode drafter partially replay earlier generations —
+> inflating absolute essay tok/s ~15–30%. The **relative** rc10 gains above were measured
+> like-for-like and **stand**; the absolute cells are replay-era. Honest v4 short-prompt c32
+> aggregate on the FP8 arm: **789 tok/s** (rotating topics + per-invocation nonce + temp 0.7 —
+> nothing is ever regenerated). Fixed in
+> [Capicua25x/modelbench](https://github.com/Capicua25x/modelbench) v4; honest tables in the
+> "Measurement update 2026-08-24" block of the Throughput section below.
 
 **Carriable fixes, each its own branch:** `fix/suppress-stops-in-reasoning` (detokenizer guard +
 CPU test — vllm-project/vllm#53066) · `fix/unified-attn-3d-smallq` (3D split-KV gate for spec-decode
@@ -324,6 +333,12 @@ index (`du -sh` prints 21G). Base sizes are upstream bf16 index totals where a c
   Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700), **all `--think raw`** — the bench's `/v1/completions` path at **temperature 0**, i.e. greedy. That is NOT the same as `--think off`, which uses `/v1/chat/completions` at temp 0.6 / top_p 0.95. The distinction matters here because this build runs MTP-3 speculative decoding: greedy decoding accepts most drafted tokens (mean acceptance 3.10), while sampled decoding rejects far more, so raw reads ~61 tok/s where chat-off reads ~51 on the same weights. Production sampling is the chat path; quote raw figures only against other raw figures: single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
   FP8), c32 aggregate 649 (old 600, FP8 430); 6k-prefill c8 29 (old 22, FP8 32). **Think-ON is a different, slower
   shape — same box, 2026-08-16: c1 46.5, c16 384, c32 531; do not compare think-OFF and think-ON numbers.**
+  *(Bench-v4 update, 2026-08-24: the bench's raw essay path now samples at temp 0.7 / top_p 0.95
+  over rotating distinct topics with a per-invocation nonce — replay-proof, nothing is ever
+  regenerated — so v4 raw figures sit near the production sampling regime rather than greedy. The
+  pre-v4 figures in this bullet, raw and think-ON alike, are replay-inflated and comparable only
+  among themselves — not to v4 raw and not to any chat figure. See the "Measurement update
+  2026-08-24" block below.)*
   gsm8k n=50 ×3 seeds and a 166-case private application regression suite unchanged vs the old kernel.
   **Scope: every think-OFF figure in this bullet was measured on the earlier RTN MXFP4 build of the same
   model, not on the Quark build now serving** — no think-OFF sweep exists for the Quark build. The two
@@ -389,6 +404,9 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 *B and C both measured on the rc10 image (2026-08-20; B carries the in-tree tuned R9700 GEMM configs).*
 
 **Throughput** (think ON, `max_tokens 256`, per-user / aggregate tok/s, warm serve, first-run cells).
+*(Pre-v4, replay-era — absolute cells are inflated ~15–30% by the fixed-prompt replay confound; the
+B-vs-C comparisons within these tables were measured like-for-like and stand as relative claims.
+See the 2026-08-24 measurement update below for honest absolutes.)*
 Short prompts (~30 tok):
 
 | users | B | C |
@@ -400,7 +418,7 @@ Short prompts (~30 tok):
 | 32 | 33 / **1,014** | 24 / 713 |
 | 64 | 24 / **1,016** | 17 / 714 |
 
-6,000-token prompts (RAG / long-system-prompt workloads):
+6,000-token prompts (RAG / long-system-prompt workloads) *(pre-v4, replay-era — see note above)*:
 
 | users | B | C |
 |---|---|---|
@@ -409,6 +427,28 @@ Short prompts (~30 tok):
 | 8 | 31 / 241 | 30 / 231 |
 | 16 | 20 / 311 | 20 / 312 |
 | 32 | 11 / 356 | 12 / 368 |
+
+**Measurement update 2026-08-24 — bench v4 (honest absolutes).** Root cause: the v3 essay workload
+reused **one fixed prompt**, and on a spec-decode server the stateful drafter partially **replays
+previously generated text**, so acceptance and tok/s inflate with the server's own content history
+(prose acceptance is also strongly topic-dependent).
+[modelbench](https://github.com/Capicua25x/modelbench) v4 (commits `0619644` + `a04d4e6`) fixes it:
+rotating distinct topics + a per-invocation nonce + temp 0.7 / top_p 0.95 — nothing is ever
+regenerated — plus per-cell accepted/draft and tok/step columns scraped from `/metrics`. The
+absolute essay cells above are replay-inflated (~15–30% on the shapes re-run); the relative B-vs-C
+and rc-ladder deltas were like-for-like and stand. Honest v4 figures, config B (FP8 + MTP-3, rc10,
+2× R9700 TP2, idle-verified; per-user / aggregate tok/s):
+
+| workload (v4) | c1 | c4 | c16 | c32 | c64 |
+|---|---|---|---|---|---|
+| short essay | 59.1 (acc 1.52/3) | 49.5 / 183 | 37.1 / 541 | 27.0 / **789** | 20.1 / 825 |
+| 6k-prefix essay | 55.4 (acc 1.60/3) | 44.1 / 168 | 21.8 / 327 | 12.8 / 390 | 8.4 / 397 |
+| trivial (count-to-300) | 98.0 | — | 64.5 / 1,030 | 47.7 / 1,523 | 35.7 / 1,521 |
+
+The 6k aggregate saturates around 390–400 from c=32 (c48: 10.0 / 373). Acceptance on novel prose is
+a uniform 1.72–1.84 of 3 drafted in the multi-user 6k cells, vs a flat 2.99/3 on trivial — the
+`--trivial` workload was always replay-free and its numbers were honest before and after v4.
+Comfort ceiling at 20 tok/s/user: ~16 in-flight at 6k prompts, ~64 at short.
 
 **Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
 window, MTP-3, 32 slots). The A/B pair we run in production:
