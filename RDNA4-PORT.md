@@ -420,7 +420,7 @@ docker run --rm --name vllm-qwen --network=host \
   --group-add=video --group-add=render --ipc=host \
   -e NCCL_PROTO=Simple \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  --entrypoint /usr/local/bin/vllm capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc9 \
+  --entrypoint /usr/local/bin/vllm capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc10 \
   serve Qwen/Qwen3.8-27B-FP8 --served-model-name qwen --port 8011 --trust-remote-code \
   --tensor-parallel-size 2 --gpu-memory-utilization 0.95 --max-model-len 262144 \
   --attention-backend TRITON_ATTN --enable-prefix-caching \
@@ -443,7 +443,7 @@ So far Qwen3.8-27B behaves correctly on both A/B configurations under production
 gates above; we will fold the verdict back here when the A/B concludes.
 
 ## Image (Docker Hub)
-`capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc9` (= `:0.26.1-rdna4` = `:latest` after the 2026-08-19
+`capicua25x/vllm-rocm-rdna4:0.26.1-rdna4-rc10` (= `:0.26.1-rdna4` = `:latest` after the 2026-08-19
 gates) — rc9 = rc8 + hardware fp8 converts + `VLLM_RDNA_P_SCALE` + the prefill-tile knob (all inert on
 bf16 KV). rc8 = rc7 + the re-tuned MXFP4 tile table (`sha256:1fffe1cb…`). rc6 = rc5 +
 `RdnaMxfp4Fp8LinearKernel`; rc5 = `sha256:0f5cbc40…` (also tagged `glimmer-qwen38-rc5`, kept).
@@ -471,12 +471,15 @@ is the noise band.
 | AA-LCR judged (100) | 0.78 | 0.77 · 0.81 (s1234·s99) | 0.78 |
 | GPQA-Diamond (60) | 0.78 | 0.85 | 0.92 |
 | AIME'25 (30) | 0.93 | 0.97 | 0.93 |
-| τ²-telecom (114) | 0.939 | ⏳ | 0.904 |
+| τ²-telecom (114) | 0.939 | 0.939 | 0.904 |
 
 Reading caveats, condensed: GSM8K under continuous batching is seed-labelled but not deterministic
 (treat single cells as draws from the seed spread); the judged rows flip ~1 item/100 on re-judge —
 never read a 1–2 item gap as a quantization result; the τ² reference is a repaired number
-(12 provider-side sim deaths re-run) while C's 0.904 is unrepaired.
+(12 provider-side sim deaths re-run) while C's 0.904 is unrepaired. B's τ²-telecom is a
+from-scratch 2026-08-21 run (107/114, think ON, 114/114 user_stop, 0 censored) — reference
+parity. Earlier B cells near 0.63 came from a launcher that silently dropped thinking; those
+are withdrawn, and `think_preflight.sh` now guards every local τ² launch.
 
 **Weights release:** the 27B Quark MXFP4 build is published:
 [`Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4`](https://huggingface.co/Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4)
