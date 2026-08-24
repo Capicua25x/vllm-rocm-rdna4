@@ -472,6 +472,10 @@ is the noise band.
 | GPQA-Diamond (60) | 0.78 | 0.85 | 0.92 |
 | AIME'25 (30) | 0.93 | 0.97 | 0.93 |
 | τ²-telecom (114) | 0.939 | 0.939 | 0.904 |
+| τ²-airline (50) | 0.760 | 0.860 | 0.840 |
+| τ²-retail (60) | 0.850 | 0.817 | 0.767 |
+| MMLU-Pro (1120) | 0.804 | 0.817 | ⏳ |
+| Terminal-Bench hard (44, 3600s/task) | 0.273 | 0.341 | ⏳ |
 
 Reading caveats, condensed: GSM8K under continuous batching is seed-labelled but not deterministic
 (treat single cells as draws from the seed spread); the judged rows flip ~1 item/100 on re-judge —
@@ -479,7 +483,11 @@ never read a 1–2 item gap as a quantization result; the τ² reference is a re
 (12 provider-side sim deaths re-run) while C's 0.904 is unrepaired. B's τ²-telecom is a
 from-scratch 2026-08-21 run (107/114, think ON, 114/114 user_stop, 0 censored) — reference
 parity. Earlier B cells near 0.63 came from a launcher that silently dropped thinking; those
-are withdrawn, and `think_preflight.sh` now guards every local τ² launch.
+are withdrawn, and `think_preflight.sh` now guards every local τ² launch. τ²-airline and τ²-retail are the same
+08-21 think-ON batch as telecom (50/50 and 60/60 user_stop). Terminal-Bench is
+terminal-bench-core with the terminus-2 agent over a 44-task subset — NOT Terminal-Bench 2.1,
+so it is not comparable to vendor-card figures; both cells are the full 44 with no exclusions.
+C's MMLU-Pro and Terminal-Bench are not yet measured.
 
 **Weights release:** the 27B Quark MXFP4 build is published:
 [`Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4`](https://huggingface.co/Capicua25x/Qwen3.8-27B-MXFP4-Quark-RDNA4)
