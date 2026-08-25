@@ -15,7 +15,7 @@ to serve well on AMD RDNA4 consumer/workstation GPUs, which are outside the offi
 >
 > **2026-08-24 measurement update (bench v4):** the essay bench behind these absolutes reused one
 > fixed prompt, which lets the stateful spec-decode drafter partially replay earlier generations —
-> inflating absolute essay tok/s (shape-dependent on re-measurement: ~10-20% on most greedy-raw cells, up to ~2x on the worst (a GB10-pair short cell), while one sampled-path 6k cell even measured slightly higher under v4 (different sampling provenance + build drift)). The **relative** rc10 gains above were measured
+> inflating absolute essay tok/s (shape-dependent on re-measurement: ≈10-20% on most greedy-raw cells, up to ≈2x on the worst (a GB10-pair short cell), while one sampled-path 6k cell even measured slightly higher under v4 (different sampling provenance + build drift)). The **relative** rc10 gains above were measured
 > like-for-like and **stand**; the absolute cells are replay-era. Honest v4 short-prompt c32
 > aggregate on the FP8 arm: **789 tok/s** (rotating topics + per-invocation nonce + temp 0.7 —
 > nothing is ever regenerated). Fixed in
@@ -119,15 +119,15 @@ Two consequences worth stating plainly, because both are easy to misread:
 
 * **`ModelQuantizer.direct_quantize_checkpoint(...)`** — file-to-file, reads the snapshot directory and
   writes the quantized one, never materializing the model. Used for five of six builds. Ships a
-  `model.safetensors.index.json`. Fast: ~4 min for the 27B on CPU; the 35B MoE stage took ~18.6 min
+  `model.safetensors.index.json`. Fast: ≈4 min for the 27B on CPU; the 35B MoE stage took ≈18.6 min
   including a 70 GB download.
 * **`preprocess_for_quantization` → `quantize_model` → `freeze` → `export_safetensors`** — required when
   the checkpoint stores experts as **stacked 3D tensors** (Gemma-4 MoE). The preprocess step explodes
   them into per-expert Linears and frees the fused source, which is both what Quark needs to see them
   and what vLLM's loader wants on the other end (`gemma4.py` accepts "already per-expert 2D weights (if
   quantized)"). File-to-file quantized **0 of 3,840** expert modules before this path was used.
-  Caveat: this exporter writes a **single `model.safetensors` with no index file** (~206 s to quantize,
-  ~5 s to export for the 26B-A4B).
+  Caveat: this exporter writes a **single `model.safetensors` with no index file** (≈206 s to quantize,
+  ≈5 s to export for the 26B-A4B).
 
 Note that `direct_quantize_checkpoint` reads `config.json` off the filesystem — it does not resolve HF
 repo ids. Snapshot first, hand it the local directory.
@@ -330,7 +330,7 @@ index (`du -sh` prints 21G). Base sizes are upstream bf16 index totals where a c
   (128–512): the weight-only in-kernel path. Prefill (M > 512): exact integer dequant to bf16 into a
   reused scratch + hipBLASLt bf16 GEMM. Selected ahead of the bf16-unpack kernel; `VLLM_RDNA_MXFP4_FP8=0`
   disables; `VLLM_RDNA_MXFP4_FP8_SKIP=<prefix,…>` keeps named layers on bf16 activations.
-  Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700), **all `--think raw`** — the bench's `/v1/completions` path at **temperature 0**, i.e. greedy. That is NOT the same as `--think off`, which uses `/v1/chat/completions` at temp 0.6 / top_p 0.95. The distinction matters here because this build runs MTP-3 speculative decoding: greedy decoding accepts most drafted tokens (mean acceptance 3.10), while sampled decoding rejects far more, so raw reads ~61 tok/s where chat-off reads ~51 on the same weights. Production sampling is the chat path; quote raw figures only against other raw figures: single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
+  Effect on Qwen3.8-27B MXFP4 TP2 (2× R9700), **all `--think raw`** — the bench's `/v1/completions` path at **temperature 0**, i.e. greedy. That is NOT the same as `--think off`, which uses `/v1/chat/completions` at temp 0.6 / top_p 0.95. The distinction matters here because this build runs MTP-3 speculative decoding: greedy decoding accepts most drafted tokens (mean acceptance 3.10), while sampled decoding rejects far more, so raw reads ≈61 tok/s where chat-off reads ≈51 on the same weights. Production sampling is the chat path; quote raw figures only against other raw figures: single-stream 51 → **61 tok/s**; short sweep c1 57 (= stock
   FP8), c32 aggregate 649 (old 600, FP8 430); 6k-prefill c8 29 (old 22, FP8 32). **Think-ON is a different, slower
   shape — same box, 2026-08-16: c1 46.5, c16 384, c32 531; do not compare think-OFF and think-ON numbers.**
   *(Bench-v4 update, 2026-08-24: the bench's raw essay path now samples at temp 0.7 / top_p 0.95
@@ -359,7 +359,7 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 
 **In the image/source (rc9 = rc8 + three attention-path changes, all env-gated):**
 * **Hardware fp8 converts on gfx12 without rebuilding Triton** — Triton 3.6.0 open-codes `f32↔e4m3fn`
-  (~33 VALU + 10 `s_wait_alu` per element) although gfx1201 has `v_cvt_pk_fp8_f32`. A plain-text LLVM-IR
+  (≈33 VALU + 10 `s_wait_alu` per element) although gfx1201 has `v_cvt_pk_fp8_f32`. A plain-text LLVM-IR
   extern library (`vllm/v1/attention/ops/rdnacvt.ll` + `rdna_cvt.py`, `tl.extern_elementwise`) emits the
   hardware ops and returns real fp8 tensors: fp8-Q attention kernel −33 %, inner loop 1,568 → 814
   instructions/iteration (= parity with the bf16-KV kernel), bit-identical outputs. Inert on bf16 KV.
@@ -370,7 +370,7 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 * `VLLM_RDNA_TILE_PREFILL` — measurement knob for the fp8-Q 2D kv-tile (default 32 = upstream).
 
 **Deployment findings you can use with ANY build (no code needed):**
-* **`NCCL_PROTO=Simple`** for TP2 over PCIe on this pair: RCCL picks the LL protocol for the ~640 KB
+* **`NCCL_PROTO=Simple`** for TP2 over PCIe on this pair: RCCL picks the LL protocol for the ≈640 KB
   decode all-reduces and LL is 2.8× slower than Simple here (205 vs 73 µs/op). Served effect on the
   FP8+fp8KV config: short-prompt c16 +17 %. Numerically identical. (Independently rediscovered by
   r/LocalLLaMA as a deadlock workaround — same flag, same hardware.)
@@ -407,7 +407,7 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 *(Pre-v4, replay-era — absolute cells are inflated by the fixed-prompt replay confound (magnitude is shape-dependent — see the measurement-update block below); the
 B-vs-C comparisons within these tables were measured like-for-like and stand as relative claims.
 See the 2026-08-24 measurement update below for honest absolutes.)*
-Short prompts (~30 tok):
+Short prompts (≈30 tok):
 
 | users | B | C |
 |---|---|---|
@@ -435,7 +435,7 @@ previously generated text**, so acceptance and tok/s inflate with the server's o
 [modelbench](https://github.com/Capicua25x/modelbench) v4 (commits `0619644` + `a04d4e6`) fixes it:
 rotating distinct topics + a per-invocation nonce + temp 0.7 / top_p 0.95 — nothing is ever
 regenerated — plus per-cell accepted/draft and tok/step columns scraped from `/metrics`. The
-absolute essay cells above are replay-inflated (shape-dependent on re-measurement: ~10-20% on most greedy-raw cells, up to ~2x on the worst (a GB10-pair short cell), while one sampled-path 6k cell even measured slightly higher under v4 (different sampling provenance + build drift)); the relative B-vs-C
+absolute essay cells above are replay-inflated (shape-dependent on re-measurement: ≈10-20% on most greedy-raw cells, up to ≈2x on the worst (a GB10-pair short cell), while one sampled-path 6k cell even measured slightly higher under v4 (different sampling provenance + build drift)); the relative B-vs-C
 and rc-ladder deltas were like-for-like and stand. Honest v4 figures, config B (FP8 + MTP-3, rc10,
 2× R9700 TP2, idle-verified; per-user / aggregate tok/s):
 
@@ -448,7 +448,7 @@ and rc-ladder deltas were like-for-like and stand. Honest v4 figures, config B (
 The 6k aggregate saturates around 390–400 from c=32 (c48: 10.0 / 373). Acceptance on novel prose is
 a uniform 1.72–1.84 of 3 drafted in the multi-user 6k cells, vs a flat 2.99/3 on trivial — the
 `--trivial` workload was always replay-free and its numbers were honest before and after v4.
-Comfort ceiling at 20 tok/s/user: ~16 in-flight at 6k prompts, ~64 at short.
+Comfort ceiling at 20 tok/s/user: ≈16 in-flight at 6k prompts, ≈64 at short.
 
 Config C (MXFP4 @ bf16 KV, same rc10 image, TP2, MTP-3, measured the same night, idle-verified):
 
@@ -458,10 +458,10 @@ Config C (MXFP4 @ bf16 KV, same rc10 image, TP2, MTP-3, measured the same night,
 | 6k-prefix essay | 54.1 (acc 1.90/3) | 40.9 / 158 | 21.5 / 325 | 12.6 / 387 | 8.7 / 395 |
 | trivial (count-to-300) | 64.5 | 74.8 / 299 | 52.6 / 741 | 36.1 / 1,042 | 27.1 / 1,039 |
 
-**The C-vs-B story under honest measurement: at realistic ~6k context the two arms are equal within
-noise at every level** (327/390/397 vs 325/387/395 aggregate; same ~16-user comfort ceiling). The
-FP8 arm's edge is confined to compute-bound shapes — trivial peak 1,523 vs 1,042 (~1.46×) and short
-prompts (~1.3–1.4×) at equal speculative acceptance, i.e. MXFP4 dequant cost, not drafting. What C
+**The C-vs-B story under honest measurement: at realistic ≈6k context the two arms are equal within
+noise at every level** (327/390/397 vs 325/387/395 aggregate; same ≈16-user comfort ceiling). The
+FP8 arm's edge is confined to compute-bound shapes — trivial peak 1,523 vs 1,042 (≈1.46×) and short
+prompts (≈1.3–1.4×) at equal speculative acceptance, i.e. MXFP4 dequant cost, not drafting. What C
 buys for that cost: the full 262k native window on the same silicon. Choose by workload: burst
 short-query capacity → B; maximum context → C; at real context sizes the throughput trade is nil.
 
@@ -474,7 +474,7 @@ are **serving**: an OpenAI-compatible endpoint with continuous batching for a fe
 shared system prompt, MTP speculative decode, and the exact quant whose accuracy table is published
 above. Chat rig → llama.cpp; small multi-user API box → this.
 
-Within the vLLM world, this quant is **the** single-card path for the 27B on RDNA4: MXFP4 weights (~21 GB) fit one
+Within the vLLM world, this quant is **the** single-card path for the 27B on RDNA4: MXFP4 weights (≈21 GB) fit one
 32GB card with room for KV; the FP8 arm does **not** (its weights alone nearly fill the card).
 Measured 2026-08-24 on 1× R9700, rc10 image, bench v4 (same replay-proof workload as the TP2
 tables; KV pool 55,426 tokens at this config):
@@ -485,7 +485,7 @@ tables; KV pool 55,426 tokens at this config):
 | short essay | 25.1 / 25 | 22.4 / 44 | 22.6 / 87 | 18.0 / 135 | 1.23–1.37 |
 | 6k-prefix essay | 28.4 / 28 | 24.8 / 49 | 22.2 / 85 | 17.2 / 132 | 1.71–1.87 |
 
-Comfort ceiling at ≥20 tok/s per user: **~4 concurrent** on realistic prompts. Serve command —
+Comfort ceiling at ≥20 tok/s per user: **≈4 concurrent** on realistic prompts. Serve command —
 one device pair, TP1, 32k window, 8 slots:
 
 ```bash
@@ -504,7 +504,7 @@ docker run --rm --name vllm-qwen --network=host \
 ```
 
 **16GB cards (RX 9070 XT): this 27B does not fit — in ANY runtime.** Our quants need 21 GB of
-weights; even a Q4 GGUF (~15.5 GB) technically loads and then leaves no room for KV, i.e. no
+weights; even a Q4 GGUF (≈15.5 GB) technically loads and then leaves no room for KV, i.e. no
 usable context window. llama.cpp's 16GB options are CPU offload (at a large speed cost) or a
 smaller model — the latter is the honest recommendation. The port's kernels run fine on gfx1200
 silicon; pair the card with a model whose weights + context leave real headroom.
@@ -593,7 +593,7 @@ is the noise band.
 | Terminal-Bench hard (44, 3600s/task) | 0.273 | 0.341 | ⏳ |
 
 Reading caveats, condensed: GSM8K under continuous batching is seed-labelled but not deterministic
-(treat single cells as draws from the seed spread); the judged rows flip ~1 item/100 on re-judge —
+(treat single cells as draws from the seed spread); the judged rows flip ≈1 item/100 on re-judge —
 never read a 1–2 item gap as a quantization result; the τ² reference is a repaired number
 (12 provider-side sim deaths re-run) while C's 0.904 is unrepaired. B's τ²-telecom is a
 from-scratch 2026-08-21 run (107/114, think ON, 114/114 user_stop, 0 censored) — reference
