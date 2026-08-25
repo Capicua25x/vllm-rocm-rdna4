@@ -499,6 +499,21 @@ docker run --rm --name vllm-qwen --network=host \
 **16GB cards (RX 9070 XT): this 27B does not fit** — 21 GB of weights in 16 GB is a hard no in
 any of our quants. The port's kernels run fine on gfx1200 silicon; pair it with a smaller model.
 
+**Max-context variant (measured 2026-08-25): add `--kv-cache-dtype fp8`** — the pool doubles to
+**113,642 tokens** (127,348 at 4 slots), which serves a **104k-token window on the single 32GB
+card** — and essay throughput *improves* (6k c1 32.4 vs 28.4; fp8 KV halves cache bandwidth):
+
+| workload (v4, TP1 + fp8 KV, 104k window, 4 slots) | c1 | c2 | c4 |
+|---|---|---|---|
+| trivial | 43.8 / 44 | 40.7 / 81 | 39.9 / 143 |
+| short essay | 29.0 / 29 | 27.6 / 51 | 23.5 / 85 |
+| 6k-prefix essay | 32.4 / 32 | 27.0 / 51 | 23.7 / 90 |
+
+Quality note: fp8 KV over this MXFP4 quant carries one accuracy smoke (gsm8k n=50 thinking-on:
+0.94 flexible / 0.88 strict — within the ±0.04 sampling noise of the bf16-KV baseline's 0.91–0.93,
+at its lower edge). Validate on your own workload before committing; a KV-calibrated variant with
+scale side-files exists if deeper validation matters to you.
+
 
 **Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
 window, MTP-3, 32 slots). The A/B pair we run in production:
