@@ -468,8 +468,7 @@ short-query capacity → B; maximum context → C; at real context sizes the thr
 ## Single card (1× R9700 / 32GB-class)
 
 **Honest positioning: for single-user chat on one card, [llama.cpp](https://github.com/ggml-org/llama.cpp)
-with a GGUF quant is the lighter tool** — single binary, no container stack, and it scales down to
-16GB cards via smaller quants and offload. This vLLM path earns its footprint on one card when you
+with a GGUF quant is the lighter tool** — single binary, no container stack, smaller-quant ladder. This vLLM path earns its footprint on one card when you
 are **serving**: an OpenAI-compatible endpoint with continuous batching for a few concurrent users
 (the c4 aggregates below are the numbers a slot-based server won't reach), prefix caching over a
 shared system prompt, MTP speculative decode, and the exact quant whose accuracy table is published
@@ -504,8 +503,11 @@ docker run --rm --name vllm-qwen --network=host \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
 ```
 
-**16GB cards (RX 9070 XT): this 27B does not fit** — 21 GB of weights in 16 GB is a hard no in
-any of our quants. The port's kernels run fine on gfx1200 silicon; pair it with a smaller model.
+**16GB cards (RX 9070 XT): this 27B does not fit — in ANY runtime.** Our quants need 21 GB of
+weights; even a Q4 GGUF (~15.5 GB) technically loads and then leaves no room for KV, i.e. no
+usable context window. llama.cpp's 16GB options are CPU offload (at a large speed cost) or a
+smaller model — the latter is the honest recommendation. The port's kernels run fine on gfx1200
+silicon; pair the card with a model whose weights + context leave real headroom.
 
 **Max-context variant (measured 2026-08-25): add `--kv-cache-dtype fp8`** — the pool doubles to
 **113,642 tokens** (127,348 at 4 slots), which serves a **104k-token window on the single 32GB
