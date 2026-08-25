@@ -467,26 +467,23 @@ short-query capacity → B; maximum context → C; at real context sizes the thr
 
 ## Single card (1× R9700 / 32GB-class)
 
-**Honest positioning: for single-user chat on one card, [llama.cpp](https://github.com/ggml-org/llama.cpp)
-with a GGUF quant is the lighter tool** — single binary, no container stack, smaller-quant ladder. This vLLM path earns its footprint on one card when you
-are **serving**: an OpenAI-compatible endpoint with continuous batching for a few concurrent users
-(the c4 aggregates below are the numbers a slot-based server won't reach), prefix caching over a
-shared system prompt, MTP speculative decode, and the exact quant whose accuracy table is published
-above. Chat rig → llama.cpp; small multi-user API box → this.
+**Single-card path: MXFP4 @ fp8 KV** — the only quant that fits (weights ≈21 GB); fp8 KV stretches
+the window from 32k to 104k. It serves — with real limits: ≈4 concurrent users and a window still
+well short of the 262k the multi-card port gets on the same silicon. llama.cpp/GGUF can also run
+this model on one card for plain chat, but skips the batching, prefix caching, and window this
+config gets from the same card — not the recommendation unless that's genuinely all you need.
 
-Within the vLLM world, this quant is **the** single-card path for the 27B on RDNA4: MXFP4 weights (≈21 GB) fit one
-32GB card with room for KV; the FP8 arm does **not** (its weights alone nearly fill the card).
-Measured 2026-08-24 on 1× R9700, rc10 image, bench v4 (same replay-proof workload as the TP2
-tables; KV pool 55,426 tokens at this config):
+Measured 2026-08-25 on 1× R9700, rc10 image, bench v4, KV pool 113,642 tokens (127,348 at 4 slots)
+→ 104k-token window:
 
-| workload (v4, TP1) | c1 | c2 | c4 | c8 | acceptance (of 3) |
-|---|---|---|---|---|---|
-| trivial (count-to-300) | 43.7 / 44 | 40.7 / 81 | 39.8 / 143 | 33.5 / 238 | 2.99–3.00 flat |
-| short essay | 25.1 / 25 | 22.4 / 44 | 22.6 / 87 | 18.0 / 135 | 1.23–1.37 |
-| 6k-prefix essay | 28.4 / 28 | 24.8 / 49 | 22.2 / 85 | 17.2 / 132 | 1.71–1.87 |
+| workload (v4, TP1 + fp8 KV, 104k window, 4 slots) | c1 | c2 | c4 |
+|---|---|---|---|
+| trivial | 43.8 / 44 | 40.7 / 81 | 39.9 / 143 |
+| short essay | 29.0 / 29 | 27.6 / 51 | 23.5 / 85 |
+| 6k-prefix essay | 32.4 / 32 | 27.0 / 51 | 23.7 / 90 |
 
-Comfort ceiling at ≥20 tok/s per user: **≈4 concurrent** on realistic prompts. Serve command —
-one device pair, TP1, 32k window, 8 slots:
+Stays ≥20 tok/s/user through c4 (untested beyond). Serve command — one device pair, TP1, 104k
+window, 4 slots:
 
 ```bash
 docker run --rm --name vllm-qwen --network=host \
@@ -496,10 +493,10 @@ docker run --rm --name vllm-qwen --network=host \
   --entrypoint /usr/local/bin/vllm capicua25x/vllm-rocm-rdna4:latest \
   serve /quant/Qwen3.8-27B-MXFP4-Quark-RDNA4 \
   --served-model-name qwen --port 8011 --trust-remote-code \
-  --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 32768 \
+  --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 106496 \
   --attention-backend TRITON_ATTN --enable-prefix-caching \
-  --max-num-seqs 8 --max-num-batched-tokens 8000 \
-  --mamba-ssm-cache-dtype bfloat16 --max-cudagraph-capture-size 32 \
+  --max-num-seqs 4 --max-num-batched-tokens 8000 \
+  --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 --max-cudagraph-capture-size 32 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
 ```
 
@@ -508,16 +505,6 @@ weights; even a Q4 GGUF (≈15.5 GB) technically loads and then leaves no room f
 usable context window. llama.cpp's 16GB options are CPU offload (at a large speed cost) or a
 smaller model — the latter is the honest recommendation. The port's kernels run fine on gfx1200
 silicon; pair the card with a model whose weights + context leave real headroom.
-
-**Max-context variant (measured 2026-08-25): add `--kv-cache-dtype fp8`** — the pool doubles to
-**113,642 tokens** (127,348 at 4 slots), which serves a **104k-token window on the single 32GB
-card** — and essay throughput *improves* (6k c1 32.4 vs 28.4; fp8 KV halves cache bandwidth):
-
-| workload (v4, TP1 + fp8 KV, 104k window, 4 slots) | c1 | c2 | c4 |
-|---|---|---|---|
-| trivial | 43.8 / 44 | 40.7 / 81 | 39.9 / 143 |
-| short essay | 29.0 / 29 | 27.6 / 51 | 23.5 / 85 |
-| 6k-prefix essay | 32.4 / 32 | 27.0 / 51 | 23.7 / 90 |
 
 Quality note: fp8 KV over this MXFP4 quant carries one accuracy smoke (gsm8k n=50 thinking-on:
 0.94 flexible / 0.88 strict — within the ±0.04 sampling noise of the bf16-KV baseline's 0.91–0.93,
