@@ -465,53 +465,6 @@ prompts (≈1.3–1.4×) at equal speculative acceptance, i.e. MXFP4 dequant cos
 buys for that cost: the full 262k native window on the same silicon. Choose by workload: burst
 short-query capacity → B; maximum context → C; at real context sizes the throughput trade is nil.
 
-## Single card (1× R9700 / 32GB-class)
-
-**Single-card path: MXFP4 @ fp8 KV** — the only quant that fits (weights ≈21 GB); fp8 KV stretches
-the window from 32k to 104k. It serves — with real limits: ≈4 concurrent users and a window still
-well short of the 262k the multi-card port gets on the same silicon. llama.cpp/GGUF can also run
-this model on one card for plain chat, but skips the batching, prefix caching, and window this
-config gets from the same card — not the recommendation unless that's genuinely all you need.
-
-Measured 2026-08-25 on 1× R9700, rc10 image, bench v4, KV pool 113,642 tokens (127,348 at 4 slots)
-→ 104k-token window:
-
-| workload (v4, TP1 + fp8 KV, 104k window, 4 slots) | c1 | c2 | c4 |
-|---|---|---|---|
-| trivial | 43.8 / 44 | 40.7 / 81 | 39.9 / 143 |
-| short essay | 29.0 / 29 | 27.6 / 51 | 23.5 / 85 |
-| 6k-prefix essay | 32.4 / 32 | 27.0 / 51 | 23.7 / 90 |
-
-Stays ≥20 tok/s/user through c4 (untested beyond). Serve command — one device pair, TP1, 104k
-window, 4 slots:
-
-```bash
-docker run --rm --name vllm-qwen --network=host \
-  --device=/dev/kfd --device=/dev/dri/renderD128 --device=/dev/dri/card1 \
-  --group-add=video --group-add=render --ipc=host \
-  -v /path/to/quants:/quant:ro -e HF_HUB_OFFLINE=1 \
-  --entrypoint /usr/local/bin/vllm capicua25x/vllm-rocm-rdna4:latest \
-  serve /quant/Qwen3.8-27B-MXFP4-Quark-RDNA4 \
-  --served-model-name qwen --port 8011 --trust-remote-code \
-  --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 106496 \
-  --attention-backend TRITON_ATTN --enable-prefix-caching \
-  --max-num-seqs 4 --max-num-batched-tokens 8000 \
-  --kv-cache-dtype fp8 --mamba-ssm-cache-dtype bfloat16 --max-cudagraph-capture-size 32 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
-```
-
-**16GB cards (RX 9070 XT): this 27B does not fit — in ANY runtime.** Our quants need 21 GB of
-weights; even a Q4 GGUF (≈15.5 GB) technically loads and then leaves no room for KV, i.e. no
-usable context window. llama.cpp's 16GB options are CPU offload (at a large speed cost) or a
-smaller model — the latter is the honest recommendation. The port's kernels run fine on gfx1200
-silicon; pair the card with a model whose weights + context leave real headroom.
-
-Quality note: fp8 KV over this MXFP4 quant carries one accuracy smoke (gsm8k n=50 thinking-on:
-0.94 flexible / 0.88 strict — within the ±0.04 sampling noise of the bf16-KV baseline's 0.91–0.93,
-at its lower edge). Validate on your own workload before committing; a KV-calibrated variant with
-scale side-files exists if deeper validation matters to you.
-
-
 **Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
 window, MTP-3, 32 slots). The A/B pair we run in production:
 
