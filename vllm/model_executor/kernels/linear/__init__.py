@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified 2026 by Capicua25x for the RDNA4 (gfx1200/gfx1201) port: register the RDNA4 MXFP4 linear kernels
+# (RdnaMxfp4LinearKernel, RdnaMxfp4Fp8LinearKernel) in the kernel selection list.
 
 """
 This module re-exports linear kernel implementations to provide a
@@ -91,6 +94,12 @@ from vllm.model_executor.kernels.linear.mxfp4.humming import (
 )
 from vllm.model_executor.kernels.linear.mxfp4.marlin import (
     MarlinMxFp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mxfp4.rdna import (
+    RdnaMxfp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mxfp4.rdna_fp8 import (
+    RdnaMxfp4Fp8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp4.xpu import (
     XPUMxFp4LinearKernel,
@@ -560,6 +569,8 @@ _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     ],
     PlatformEnum.ROCM: [
         AiterMxfp4LinearKernel,
+        RdnaMxfp4Fp8LinearKernel,   # RDNA4: MXFP4 x e4m3 on FP8 WMMA (VLLM_RDNA_MXFP4_FP8=0 to disable)
+        RdnaMxfp4LinearKernel,      # RDNA4: weight-only, bf16 dequant in-kernel
         EmulationMxfp4LinearKernel,
     ],
     PlatformEnum.XPU: [
@@ -1156,6 +1167,8 @@ def register_linear_kernel(
 
 
 __all__ = [
+    "RdnaMxfp4LinearKernel",
+    "RdnaMxfp4Fp8LinearKernel",
     "init_fp8_linear_kernel",
     "init_int8_linear_kernel",
     "init_nvfp4_linear_kernel",

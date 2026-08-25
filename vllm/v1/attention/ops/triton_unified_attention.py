@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified 2026 by Capicua25x for the RDNA4 (gfx1200/gfx1201) port: allow the 3D split-KV path for
+# small-q spec-decode verify shapes (MAX_QLEN_3D), restoring MTP verify throughput.
 
 # Authors:
 #  - Burkhard Ringlein <ngl@zurich.ibm.com>
@@ -7,6 +10,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
 from typing import Any
 
 import torch
@@ -31,12 +35,48 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
+# --- RDNA4 hardware fp8 convert (rc9, 2026-08-19): gfx12 v_cvt_pk_fp8_f32 / v_cvt_f32_fp8 via an extern
+# LLVM-IR library (rdnacvt.ll next to this file). Triton 3.6.0's AMD backend open-codes these casts (33 / 26
+# VALU + 10 / 9 s_wait_alu per element); measured -33% on the fp8-Q attention kernel, outputs identical.
+# VLLM_RDNA_HW_FP8CVT=0 restores the software casts for A/B. Inert on the bf16 (arm C) path.
+from vllm.v1.attention.ops import rdna_cvt as _rdna_cvt
+
+def _rdna4_platform() -> bool:
+    try:
+        from vllm.platforms import current_platform as _cp
+        if not _cp.is_rocm():
+            return False
+        from vllm.platforms.rocm import on_rdna4
+        return on_rdna4()
+    except Exception:
+        return False
+
+# Hardware fp8 converts are RDNA4-only: the extern .ll targets amdgcn gfx12, so
+# the default must never turn on for other platforms (a CUDA/CDNA build linking
+# __rdnacvt_* symbols would fail kernel compilation).
+_HW_CVT = _rdna4_platform() and os.environ.get('VLLM_RDNA_HW_FP8CVT', '1') == '1'
+_RDNA_TILE_PREFILL = int(os.environ.get('VLLM_RDNA_TILE_PREFILL', '32'))
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
+# RDNA4 2026-08-18 (Capicua25x): exponent shift applied to the softmax probabilities before they are
+# cast to e4m3 on the fp8-query path -- see the P/V dot inside the kernel.  Triton's AMD software
+# downcast (ElementwiseOpToLLVM.cpp, LUT entry 0 = 0x3a800000 = 2^-10) zeroes every f32 at or below
+# 2^-10, so without a shift any key whose probability is under 1/1024 of the row maximum is dropped
+# from the numerator while still being counted in the softmax denominator L.  P <= 1 by construction,
+# so 2^8 is the largest shift that cannot clip (256 < 448 = e4m3 max) and it lowers the floor to
+# 2^-18.  The shift is undone by folding 1/P_SCALE into value_scale, which the epilogue already
+# applies on exactly this path.  VLLM_RDNA_P_SCALE=1 restores upstream numerics for A/B.
+_RDNA_P_SCALE = float(os.environ.get("VLLM_RDNA_P_SCALE", "256"))
+if not 1.0 <= _RDNA_P_SCALE <= float8_info.max:
+    raise ValueError(
+        f"VLLM_RDNA_P_SCALE must be in [1, {float8_info.max}] "
+        f"(P <= 1 and the cast saturates at the fp8 max); got {_RDNA_P_SCALE}"
+    )
+
 
 @triton.jit
-def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
+def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr, HW_CVT: tl.constexpr = False):
     """Cast a loaded KV tile to Q's dtype, dequantizing if needed.
 
     Modes handled inside the core kernel:
@@ -51,6 +91,8 @@ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
     if KV_QUANT_MODE == 1:
         if Q.dtype.is_fp8():
             return data.to(Q.dtype)
+        if HW_CVT and data.dtype.is_fp8():
+            return (_rdna_cvt.e4m3_to_f32(data) * tl.load(tensor_scale)).to(Q.dtype)
         return (data.to(tl.float32) * tl.load(tensor_scale)).to(Q.dtype)
     return data.to(Q.dtype)
 
@@ -285,10 +327,15 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    HW_CVT: tl.constexpr = False,
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
+    # Exponent shift folded into P before its e4m3 cast and back out of
+    # ``value_scale`` in the epilogue.  1.0 == upstream behaviour.  Ignored
+    # unless USE_FP8_Q_DESCALE -- that is the only path where V is e4m3.
+    P_SCALE: tl.constexpr = 1.0,
 ):
     # Per-(token, head) scale caches: used iff KV_QUANT_MODE in {2, 3}.
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = (KV_QUANT_MODE >= 2) and (
@@ -384,7 +431,10 @@ def kernel_unified_attention(
     value_scale = 1.0
     if USE_FP8_Q_DESCALE:
         score_scale = scale * tl.load(q_scale) * tl.load(k_scale)
-        value_scale = tl.load(v_scale)
+        # 1/P_SCALE undoes the exponent shift applied to P before its e4m3 cast.  acc carries the
+        # shift uniformly -- the alpha rescaling and the /L division both preserve it -- so this
+        # single multiply is the whole correction, in both the 2D and 3D epilogues.
+        value_scale = tl.load(v_scale) * (1.0 / P_SCALE)
 
     context_len = seq_len - cur_batch_query_len
 
@@ -489,8 +539,8 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE, HW_CVT)
+        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE, HW_CVT)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
@@ -580,6 +630,16 @@ def kernel_unified_attention(
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
             acc += tl.dot(P_v, V)
+        elif USE_FP8_Q_DESCALE and P_SCALE != 1.0 and HW_CVT:
+            # hardware e4m3 downcast of the shifted P (P*P_SCALE <= 256 < 448: cannot overflow)
+            acc += tl.dot(_rdna_cvt.f32_to_e4m3(P * P_SCALE), V)
+        elif USE_FP8_Q_DESCALE and P_SCALE != 1.0:
+            # V is e4m3 on this path (``_cast_kv_tile`` keeps K/V in fp8 when Q is fp8), so the cast
+            # below would flush every P <= 2^-10 to zero.  Shift P up first; ``value_scale`` shifts
+            # the accumulator back down.  P <= 1, so P * P_SCALE <= P_SCALE <= 448: no clipping.
+            acc += tl.dot((P * P_SCALE).to(V.dtype), V)
+        elif HW_CVT and V.dtype.is_fp8():
+            acc += tl.dot(_rdna_cvt.f32_to_e4m3(P), V)
         else:
             acc += tl.dot(P.to(V.dtype), V)
 
@@ -792,8 +852,11 @@ def _get_tile_size(
         # Gemma3: use 32 for decode (default is 16)
         return 32
 
-    # Default behavior
+    # Default behavior. RDNA4 (rc9): VLLM_RDNA_TILE_PREFILL overrides the 2D tile for fp8 queries only
+    # (measured: TILE=16 on the fp8-Q 2D path is -15% instr/KV-token, 256->145 VGPR, 0 spills; e2e unmeasured).
     if is_prefill:
+        if element_size == 1:
+            return _RDNA_TILE_PREFILL
         return 32
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
@@ -942,17 +1005,37 @@ def unified_attention(
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
     # more query rows per block + 8 warps is ~2x faster on B200.
+    # RDNA4 overlay 2026-08-18: the predicate below is gated to CUDA capability family 100
+    # (Blackwell). Qwen3.8-27B is head_size 256 with num_queries_per_kv 6, so gfx1201 matches every
+    # other clause and gets the untuned, decode-oriented tiling on prefill-shaped launches -- which
+    # is where our measured ~3.2K tok/s prefill ceiling lives. VLLM_RDNA_TUNED_HEAD=1 lets the same
+    # tuning apply on ROCm so it can be measured; unset, behaviour is byte-identical to upstream.
+    _rdna_allow = os.environ.get("VLLM_RDNA_TUNED_HEAD", "0") == "1"
     tuned_large_head = (
         head_size == 256
         and max_seqlen_q > 1
         and num_queries_per_kv <= 16
-        and current_platform.is_device_capability_family(100)
+        and (
+            current_platform.is_device_capability_family(100)
+            or (_rdna_allow and current_platform.is_rocm())
+        )
     )
     if tuned_large_head:
         BLOCK_M = 32
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
         launch_num_stages = 2
+    # Explicit sweep overrides, applied last so they win over every heuristic above.
+    _rdna_bm = os.environ.get("VLLM_RDNA_BLOCK_M")
+    if _rdna_bm:
+        BLOCK_M = int(_rdna_bm)
+        BLOCK_Q = max(1, BLOCK_M // num_queries_per_kv)
+    _rdna_w = os.environ.get("VLLM_RDNA_WARPS")
+    if _rdna_w:
+        launch_num_warps = int(_rdna_w)
+    _rdna_s = os.environ.get("VLLM_RDNA_STAGES")
+    if _rdna_s:
+        launch_num_stages = int(_rdna_s)
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1038,14 +1121,22 @@ def unified_attention(
     # 2. The batch includes at least one prefill request, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    # RDNA4 verify fix (2026-08-12): allow the 3D (split-KV) path also for
+    # spec-decode VERIFY shapes (small q_len > 1). With the original
+    # `max_seqlen_q > 1` gate, an MTP verify of q_len=4 over ~7k KV fell to the
+    # 2D grid (~8-10 workgroups on 64 CUs) -> 1,279 us/launch. The segment
+    # buffers are indexed PER TOKEN (reduce_segments already is), so the correct
+    # capacity guard is q.shape[0] (tokens), not num_seqs. Same gate change
+    # attempted by stalled upstream PRs #45450/#46724/#44652.
+    MAX_QLEN_3D = 8
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        or max_seqlen_q > MAX_QLEN_3D
+        or q.shape[0] > seq_threshold_3D
         or is_batch_invariant
     )
 
@@ -1080,6 +1171,8 @@ def unified_attention(
     else:
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
+
+    q_is_fp8 = q.dtype == current_platform.fp8_dtype()
 
     launch_kwargs: dict[str, int] = {}
     if launch_num_warps is not None:
@@ -1157,13 +1250,16 @@ def unified_attention(
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
         KV_QUANT_MODE=kv_quant_mode,
-        Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
+        Q_IS_FP8=q_is_fp8,
+        HW_CVT=_HW_CVT,
+        P_SCALE=(_RDNA_P_SCALE if q_is_fp8 else 1.0),
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
         **launch_kwargs,
+        **({'extern_libs': _rdna_cvt.EXTERN_LIBS} if _HW_CVT else {}),
     )
 
     if use_3d:
