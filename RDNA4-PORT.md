@@ -465,6 +465,41 @@ prompts (~1.3–1.4×) at equal speculative acceptance, i.e. MXFP4 dequant cost,
 buys for that cost: the full 262k native window on the same silicon. Choose by workload: burst
 short-query capacity → B; maximum context → C; at real context sizes the throughput trade is nil.
 
+## Single card (1× R9700 / 32GB-class)
+
+This quant is **the** single-card path for the 27B on RDNA4: MXFP4 weights (~21 GB) fit one
+32GB card with room for KV; the FP8 arm does **not** (its weights alone nearly fill the card).
+Measured 2026-08-24 on 1× R9700, rc10 image, bench v4 (same replay-proof workload as the TP2
+tables; KV pool 55,426 tokens at this config):
+
+| workload (v4, TP1) | c1 | c2 | c4 | c8 | acceptance (of 3) |
+|---|---|---|---|---|---|
+| trivial (count-to-300) | 43.7 / 44 | 40.7 / 81 | 39.8 / 143 | 33.5 / 238 | 2.99–3.00 flat |
+| short essay | 25.1 / 25 | 22.4 / 44 | 22.6 / 87 | 18.0 / 135 | 1.23–1.37 |
+| 6k-prefix essay | 28.4 / 28 | 24.8 / 49 | 22.2 / 85 | 17.2 / 132 | 1.71–1.87 |
+
+Comfort ceiling at ≥20 tok/s per user: **~4 concurrent** on realistic prompts. Serve command —
+one device pair, TP1, 32k window, 8 slots:
+
+```bash
+docker run --rm --name vllm-qwen --network=host \
+  --device=/dev/kfd --device=/dev/dri/renderD128 --device=/dev/dri/card1 \
+  --group-add=video --group-add=render --ipc=host \
+  -v /path/to/quants:/quant:ro -e HF_HUB_OFFLINE=1 \
+  --entrypoint /usr/local/bin/vllm capicua25x/vllm-rocm-rdna4:latest \
+  serve /quant/Qwen3.8-27B-MXFP4-Quark-RDNA4 \
+  --served-model-name qwen --port 8011 --trust-remote-code \
+  --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 32768 \
+  --attention-backend TRITON_ATTN --enable-prefix-caching \
+  --max-num-seqs 8 --max-num-batched-tokens 8000 \
+  --mamba-ssm-cache-dtype bfloat16 --max-cudagraph-capture-size 32 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
+```
+
+**16GB cards (RX 9070 XT): this 27B does not fit** — 21 GB of weights in 16 GB is a hard no in
+any of our quants. The port's kernels run fine on gfx1200 silicon; pair it with a smaller model.
+
+
 **Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
 window, MTP-3, 32 slots). The A/B pair we run in production:
 
