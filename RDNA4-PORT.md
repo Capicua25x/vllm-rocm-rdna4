@@ -467,7 +467,15 @@ short-query capacity → B; maximum context → C; at real context sizes the thr
 
 ## Single card (1× R9700 / 32GB-class)
 
-This quant is **the** single-card path for the 27B on RDNA4: MXFP4 weights (~21 GB) fit one
+**Honest positioning: for single-user chat on one card, [llama.cpp](https://github.com/ggml-org/llama.cpp)
+with a GGUF quant is the lighter tool** — single binary, no container stack, and it scales down to
+16GB cards via smaller quants and offload. This vLLM path earns its footprint on one card when you
+are **serving**: an OpenAI-compatible endpoint with continuous batching for a few concurrent users
+(the c4 aggregates below are the numbers a slot-based server won't reach), prefix caching over a
+shared system prompt, MTP speculative decode, and the exact quant whose accuracy table is published
+above. Chat rig → llama.cpp; small multi-user API box → this.
+
+Within the vLLM world, this quant is **the** single-card path for the 27B on RDNA4: MXFP4 weights (~21 GB) fit one
 32GB card with room for KV; the FP8 arm does **not** (its weights alone nearly fill the card).
 Measured 2026-08-24 on 1× R9700, rc10 image, bench v4 (same replay-proof workload as the TP2
 tables; KV pool 55,426 tokens at this config):
