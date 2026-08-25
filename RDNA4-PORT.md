@@ -15,7 +15,7 @@ to serve well on AMD RDNA4 consumer/workstation GPUs, which are outside the offi
 >
 > **2026-08-24 measurement update (bench v4):** the essay bench behind these absolutes reused one
 > fixed prompt, which lets the stateful spec-decode drafter partially replay earlier generations —
-> inflating absolute essay tok/s ~15–30%. The **relative** rc10 gains above were measured
+> inflating absolute essay tok/s (shape-dependent on re-measurement: ~10-20% on most greedy-raw cells, up to ~2x on the worst (a GB10-pair short cell), while one sampled-path 6k cell even measured slightly higher under v4 (different sampling provenance + build drift)). The **relative** rc10 gains above were measured
 > like-for-like and **stand**; the absolute cells are replay-era. Honest v4 short-prompt c32
 > aggregate on the FP8 arm: **789 tok/s** (rotating topics + per-invocation nonce + temp 0.7 —
 > nothing is ever regenerated). Fixed in
@@ -404,7 +404,7 @@ native 262,144-token window with MTP-3. Numbers are single-run cells from a fixe
 *B and C both measured on the rc10 image (2026-08-20; B carries the in-tree tuned R9700 GEMM configs).*
 
 **Throughput** (think ON, `max_tokens 256`, per-user / aggregate tok/s, warm serve, first-run cells).
-*(Pre-v4, replay-era — absolute cells are inflated ~15–30% by the fixed-prompt replay confound; the
+*(Pre-v4, replay-era — absolute cells are inflated by the fixed-prompt replay confound (magnitude is shape-dependent — see the measurement-update block below); the
 B-vs-C comparisons within these tables were measured like-for-like and stand as relative claims.
 See the 2026-08-24 measurement update below for honest absolutes.)*
 Short prompts (~30 tok):
@@ -435,7 +435,7 @@ previously generated text**, so acceptance and tok/s inflate with the server's o
 [modelbench](https://github.com/Capicua25x/modelbench) v4 (commits `0619644` + `a04d4e6`) fixes it:
 rotating distinct topics + a per-invocation nonce + temp 0.7 / top_p 0.95 — nothing is ever
 regenerated — plus per-cell accepted/draft and tok/step columns scraped from `/metrics`. The
-absolute essay cells above are replay-inflated (~15–30% on the shapes re-run); the relative B-vs-C
+absolute essay cells above are replay-inflated (shape-dependent on re-measurement: ~10-20% on most greedy-raw cells, up to ~2x on the worst (a GB10-pair short cell), while one sampled-path 6k cell even measured slightly higher under v4 (different sampling provenance + build drift)); the relative B-vs-C
 and rc-ladder deltas were like-for-like and stand. Honest v4 figures, config B (FP8 + MTP-3, rc10,
 2× R9700 TP2, idle-verified; per-user / aggregate tok/s):
 
@@ -449,6 +449,21 @@ The 6k aggregate saturates around 390–400 from c=32 (c48: 10.0 / 373). Accepta
 a uniform 1.72–1.84 of 3 drafted in the multi-user 6k cells, vs a flat 2.99/3 on trivial — the
 `--trivial` workload was always replay-free and its numbers were honest before and after v4.
 Comfort ceiling at 20 tok/s/user: ~16 in-flight at 6k prompts, ~64 at short.
+
+Config C (MXFP4 @ bf16 KV, same rc10 image, TP2, MTP-3, measured the same night, idle-verified):
+
+| workload (v4) | c1 | c4 | c16 | c32 | c64 |
+|---|---|---|---|---|---|
+| short essay | 43.4 (acc 1.14/3) | 43.7 / 166 | 30.2 / 448 | 20.5 / 602 | 13.8 / 576 |
+| 6k-prefix essay | 54.1 (acc 1.90/3) | 40.9 / 158 | 21.5 / 325 | 12.6 / 387 | 8.7 / 395 |
+| trivial (count-to-300) | 64.5 | 74.8 / 299 | 52.6 / 741 | 36.1 / 1,042 | 27.1 / 1,039 |
+
+**The C-vs-B story under honest measurement: at realistic ~6k context the two arms are equal within
+noise at every level** (327/390/397 vs 325/387/395 aggregate; same ~16-user comfort ceiling). The
+FP8 arm's edge is confined to compute-bound shapes — trivial peak 1,523 vs 1,042 (~1.46×) and short
+prompts (~1.3–1.4×) at equal speculative acceptance, i.e. MXFP4 dequant cost, not drafting. What C
+buys for that cost: the full 262k native window on the same silicon. Choose by workload: burst
+short-query capacity → B; maximum context → C; at real context sizes the throughput trade is nil.
 
 **Full serve commands** (2× R9700 shown; adjust `--device` paths to your cards; TP2, full native 262k
 window, MTP-3, 32 slots). The A/B pair we run in production:
