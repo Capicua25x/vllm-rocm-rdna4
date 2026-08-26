@@ -576,7 +576,18 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
-        self.supports_quant_query_input = current_platform.is_cuda()
+        # RDNA4 overlay (2026-08-16, kv8 prefill fix): upstream gates fp8-query input to CUDA. On ROCm the
+        # kernel then dequantizes K/V (fp8->f32*scale->bf16) INSIDE the KV loop for every (query block x
+        # KV tile) pair - O(Q*K) conversions - which made fp8-KV prefill ~5x slower than bf16 KV on gfx1201
+        # (1.75K tok/s vs 7-10K; decode only -13%). With fp8 Q the kernel takes the USE_FP8_Q_DESCALE path:
+        # dot(Q_fp8, K_fp8) and dot(P_fp8, V_fp8) on the fp8 WMMA unit (v_wmma_f32_16x16x16_fp8_fp8, the same
+        # unit rc6's MXFP4 kernel rides), scales folded into S / acc; numerics = upstream's CUDA fp8-KV path.
+        # Kill switch: VLLM_RDNA_FP8_Q=0 restores the dequant path for A/B comparisons.
+        import os as _os
+
+        self.supports_quant_query_input = current_platform.is_cuda() or (
+            current_platform.is_rocm() and _os.environ.get("VLLM_RDNA_FP8_Q", "1") == "1"
+        )
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
