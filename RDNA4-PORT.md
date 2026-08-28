@@ -50,8 +50,9 @@ head-to-head on this hardware, same hour/weights/bench (2026-08-28, his `:dev` +
 capture-64 — the max his memory model fits for this checkpoint on 2×32 GB): **his stack 73.2 tok/s @6k c1
 (+12% over this port's DFlash2 profile at 65.2) · this port 307–313 aggregate @c16 vs his 213 (+44%,
 KV-pool-limited on his side) · full 262k window here vs 16k there.** His
-[RFI8-AA quant](https://huggingface.co/tcclaviger/Qwen3.8-27B-RFI8-AA) is his recommended path for this model
-(different weights, not benchmarked here). If pure single-stream speed is your entire workload, evaluate his stack. Complete `docker run` commands for both profiles are on the
+[RFI8-AA quant](https://huggingface.co/tcclaviger/Qwen3.8-27B-RFI8-AA) is his recommended path for this model —
+attempted same-day per its card (calibrated fp8 KV + native MTP): the memory claim held (+3.15 GiB KV headroom
+vs negative on vendor FP8) but the worker died natively before serving, twice; no RFI8 row benchmarked. If pure single-stream speed is your entire workload, evaluate his stack. Complete `docker run` commands for both profiles are on the
 [Docker Hub page](https://hub.docker.com/r/capicua25x/vllm-rocm-rdna4). Measured on this hardware, the V2 model
 runner is equivalent to V1 in output-quality class and MTP throughput (±3% at every level, same ceiling) — the
 profile difference is the drafter, not the runner.
