@@ -169,6 +169,54 @@ def _resolve_layer_attention(
     return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 
+
+# ==== BEGIN rdna4 fp8-draft dequant (rc13 overlay) ====
+_FP8_DTYPES = tuple(
+    getattr(torch, n) for n in ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2")
+    if hasattr(torch, n)
+)
+
+
+def _dequant_linear_weight_rdna4(linear: nn.Module, dtype: torch.dtype) -> torch.Tensor:
+    """[out, in] weight of a vLLM linear layer in `dtype`, dequantizing fp8 weights.
+
+    Handles per-tensor / per-channel `weight_scale` and block-scaled
+    `weight_scale_inv` ([ceil(out/bo), ceil(in/bi)], a dequant multiplier despite
+    the name — same convention as Fp8LinearMethod.apply's bf16 fallback). A
+    transposed [in, out] layout (what TritonFp8BlockScaledMMKernel leaves after
+    process_weights_after_loading) is recognised via input_size_per_partition.
+    """
+    weight = linear.weight
+    if weight.dtype not in _FP8_DTYPES:
+        return weight if weight.dtype == dtype else weight.to(dtype)
+    scale = getattr(linear, "weight_scale_inv", None)
+    if scale is None:
+        scale = getattr(linear, "weight_scale", None)
+    if scale is None:
+        raise ValueError("fp8 weight without weight_scale(_inv); cannot dequantize")
+    w = weight
+    s = scale.to(torch.float32)
+    in_size = getattr(linear, "input_size_per_partition", None)
+    if in_size is not None and w.shape[1] != in_size and w.shape[0] == in_size:
+        w = w.t()
+        if s.dim() == 2:
+            s = s.t()
+    w = w.to(torch.float32)
+    if s.numel() == 1:
+        return (w * s).to(dtype)
+    if s.dim() == 1:
+        if s.shape[0] != w.shape[0]:
+            raise ValueError(f"per-channel scale {tuple(s.shape)} vs weight {tuple(w.shape)}")
+        return (w * s[:, None]).to(dtype)
+    if s.dim() != 2:
+        raise ValueError(f"unsupported scale shape {tuple(s.shape)}")
+    bo = -(-w.shape[0] // s.shape[0])
+    bi = -(-w.shape[1] // s.shape[1])
+    s_full = s.repeat_interleave(bo, dim=0)[: w.shape[0]]
+    s_full = s_full.repeat_interleave(bi, dim=1)[:, : w.shape[1]]
+    return (w * s_full).to(dtype)
+# ==== END rdna4 fp8-draft dequant ====
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -487,8 +535,20 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+        # RDNA4 overlay (rc13, 2026-08-27): a quantized draft keeps qkv_proj.weight
+        # in fp8 (tcclaviger/Qwen3.8-27B-DFlash2-FP8 = block-scaled e4m3 128x128),
+        # and the fused context-KV GEMM below is a plain F.linear on bf16
+        # activations -> "BFloat16 != Float8_e4m3fn" at the first prefill (08-25).
+        # Dequantize the KV rows ONCE here (this runs inside load_weights, i.e.
+        # before process_weights_after_loading, so the layout is the raw [out, in]
+        # + [out/128, in/128] scale). The per-step draft path is untouched: the
+        # layers' own qkv_proj.apply() stays on the quant-aware fp8 GEMM.
+        act_dtype = self._hidden_norm_weight.dtype
+        kv_weights = [
+            _dequant_linear_weight_rdna4(a.qkv_proj, act_dtype)[a.q_size :]
+            for a in layers_attn
+        ]
+        self._fused_kv_weight = torch.cat(kv_weights, dim=0).contiguous()
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
