@@ -1,3 +1,10 @@
+> ## ⚡ This fork: vLLM 0.28.0 ported to AMD RDNA4 (gfx1200/gfx1201 — Radeon AI PRO R9700, RX 9070 XT)
+> **Start here → [RDNA4-PORT.md](RDNA4-PORT.md)** — what's ported, release notes (current: **rc12**, 2026-08-28),
+> and the two serving profiles we run in production: **MTP-3** (concurrency, default) vs **DFlash2-FP8**
+> (dev-box single-stream, +18–26%), plus the compile-cache reproducibility note. Previous cycle (0.26.1, with the
+> MXFP4 recipe and full accuracy grids): [`rdna4-port-0.26.1`](https://github.com/Capicua25x/vllm-rocm-rdna4/tree/rdna4-port-0.26.1).
+> Docker image: `capicua25x/vllm-rocm-rdna4:0.28.0-rdna4` (= `:latest`). Upstream README follows below.
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
