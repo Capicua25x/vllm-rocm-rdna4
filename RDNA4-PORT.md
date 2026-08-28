@@ -44,7 +44,10 @@ Attribution and lineage are unchanged from that document.
 
 Target checkpoint for both: [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) (vendor stock).
 Dev-box drafter: [tcclaviger/Qwen3.8-27B-DFlash2-FP8](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8)
-(community quant — credit to tcclaviger). Complete `docker run` commands for both profiles are on the
+(community quant — credit to tcclaviger). tcclaviger also maintains his own RDNA4 vLLM stack —
+[tcclaviger/vllm](https://hub.docker.com/r/tcclaviger/vllm) (closed-source, native HIP kernels, baked-in
+quantizers/tuner), aggressively optimized for low-concurrency / single-stream serving — worth evaluating if that
+is your entire workload (no same-window head-to-head has been run; no comparative claim made). Complete `docker run` commands for both profiles are on the
 [Docker Hub page](https://hub.docker.com/r/capicua25x/vllm-rocm-rdna4). Measured on this hardware, the V2 model
 runner is equivalent to V1 in output-quality class and MTP throughput (±3% at every level, same ceiling) — the
 profile difference is the drafter, not the runner.
