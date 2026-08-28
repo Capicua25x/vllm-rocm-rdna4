@@ -46,8 +46,11 @@ Target checkpoint for both: [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Q
 Dev-box drafter: [tcclaviger/Qwen3.8-27B-DFlash2-FP8](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8)
 (community quant — credit to tcclaviger). tcclaviger also maintains his own RDNA4 vLLM stack —
 [tcclaviger/vllm](https://hub.docker.com/r/tcclaviger/vllm) (closed-source, native HIP kernels, baked-in
-quantizers/tuner), aggressively optimized for low-concurrency / single-stream serving — worth evaluating if that
-is your entire workload (no same-window head-to-head has been run; no comparative claim made). Complete `docker run` commands for both profiles are on the
+quantizers/tuner). Measured on this hardware (Aug 2026, different builds/windows — deltas approximate): his
+image led single-stream throughput (~79 tok/s @6k c1 vs 63–68 here, ~15–20%), while this port's DFlash2
+implementation landed slightly more tokens per step (3.61 @ 2.59/7 accepted vs 3.51 @ 2.53/7) — the gap is his
+native HIP kernel path vs our Triton path, not the drafter. His concurrency cells are unmeasured here. If pure
+single-stream speed is your entire workload, evaluate his stack. Complete `docker run` commands for both profiles are on the
 [Docker Hub page](https://hub.docker.com/r/capicua25x/vllm-rocm-rdna4). Measured on this hardware, the V2 model
 runner is equivalent to V1 in output-quality class and MTP throughput (±3% at every level, same ceiling) — the
 profile difference is the drafter, not the runner.
