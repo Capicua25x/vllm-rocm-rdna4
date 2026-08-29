@@ -51,6 +51,17 @@ quantizers/tuner). Complete `docker run` commands for both profiles are on the
 runner is equivalent to V1 in output-quality class and MTP throughput (±3% at every level, same ceiling) — the
 profile difference is the drafter, not the runner.
 
+## Serving Ornith-1.5-35B-A3B — MXFP4 MoE on gfx12
+
+Get the quant: **[Capicua25x/Ornith-1.5-35B-A3B-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/Ornith-1.5-35B-A3B-MXFP4-Quark-RDNA4)** — data-free Quark MXFP4 of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) (MIT), 67 GB bf16 → **21.4 GB**, with a **bundled 737 MB DFlash drafter** for single-stream serving. The model card carries the full 5-seed quality table (tracks the official FP8 within seed noise; τ²-telecom **0.965**, 110/114), the same-protocol throughput grid, and complete `docker run` commands for both profiles — the [Docker Hub page](https://hub.docker.com/r/capicua25x/vllm-rocm-rdna4) mirrors them.
+
+The two flags that make it work on this image, and the two mistakes that silently ruin it:
+
+- `--moe-backend triton_unfused --attention-backend TRITON_ATTN` — the quant is weight-only (`input_tensors: null`) precisely so the unfused Triton MoE lane engages. Do **not** serve MXFP4 MoE with the default (`auto`) backend on ROCm gfx12: every native MXFP4 MoE backend is CUDA/CDNA-gated and the fallback is per-call quantize-dequantize emulation (~5× slower, ~1-user ceiling).
+- `--enable-auto-tool-choice --tool-call-parser qwen3_coder` — this model family emits the qwen3-coder XML tool format; a JSON parser (hermes-style) silently turns tool calls into text and craters agentic scores (we measured τ² collapsing 0.965 → 0.14 before catching it).
+
+Measured on 2× R9700 TP2: concurrency profile **782 agg tok/s @c32** on 6k prefill (~32-user ceiling); bundled-DFlash single-stream **92.5 tok/s** short / **64.2** @6k at c1 (not for concurrent load — the drafter's separate KV pool degrades under long-context batch pressure).
+
 ## Reproducibility — same config, different outputs, and why
 
 vLLM compiles the model with inductor autotuning: candidate kernels are **benchmarked at first startup** and
