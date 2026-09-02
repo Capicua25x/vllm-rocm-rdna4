@@ -4,6 +4,7 @@
 > (dev-box single-stream, +18–26%), plus the compile-cache reproducibility note. Previous cycle (0.26.1, with the
 > MXFP4 recipe and full accuracy grids): [`rdna4-port-0.26.1`](https://github.com/Capicua25x/vllm-rocm-rdna4/tree/rdna4-port-0.26.1).
 > Also served on this image: **[Ornith-1.5-35B-A3B MXFP4](https://huggingface.co/Capicua25x/Ornith-1.5-35B-A3B-MXFP4-Quark-RDNA4)** (256-expert MoE on gfx12, bundled DFlash drafter) — serving notes in [RDNA4-PORT.md](RDNA4-PORT.md).
+> Also: **[Muse-Glimmer-30B MXFP4](https://huggingface.co/Capicua25x/Muse-Glimmer-30B-MXFP4-Quark-RDNA4)** (dense 30B VL, Apache-2.0, 1M-context profile + native config, bundled DFlash2 drafter) — serving section in `RDNA4-PORT.md`.
 > Docker image: `capicua25x/vllm-rocm-rdna4:0.28.0-rdna4` (= `:latest`). Upstream README follows below.
 
 <!-- markdownlint-disable MD001 MD041 -->
