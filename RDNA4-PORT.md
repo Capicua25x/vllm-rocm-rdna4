@@ -62,6 +62,31 @@ The two flags that make it work on this image, and the two mistakes that silentl
 
 Measured on 2× R9700 TP2: concurrency profile **782 agg tok/s @c32** on 6k prefill (~32-user ceiling); bundled-DFlash single-stream **92.5 tok/s** short / **64.2** @6k at c1 (not for concurrent load — the drafter's separate KV pool degrades under long-context batch pressure).
 
+## Serving Muse-Glimmer-30B — MXFP4 dense VL on gfx12, 1M-context profile
+
+Get the quant: **[Capicua25x/Muse-Glimmer-30B-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/Muse-Glimmer-30B-MXFP4-Quark-RDNA4)** — Quark MXFP4 of [meta-models/Muse-Glimmer-30B](https://huggingface.co/meta-models/Muse-Glimmer-30B) (Apache-2.0): the 52 MLP blocks in MXFP4 (group 32, e8m0 scales), attention / vision tower / head in bf16, 28 GB on disk. Ships **two configs** — the default `config.json` has YaRN ×8 baked (window 1,048,576) and `config.json.bak-native131k` is the native window — plus the **bundled z-lab DFlash2 drafter** (`dflash-draft/`, Apache-2.0, unmodified).
+
+```bash
+# concurrency profile (default, 1M window — ~16 concurrent users on 2×R9700)
+docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface capicua25x/vllm-rocm-rdna4:0.28.0-rdna4 \
+  serve Capicua25x/Muse-Glimmer-30B-MXFP4-Quark-RDNA4 --port 8011 --trust-remote-code --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.90 --max-model-len 1048576 --attention-backend TRITON_ATTN --moe-backend triton_unfused \
+  --enable-prefix-caching --max-num-seqs 32 --max-num-batched-tokens 8000 --max-cudagraph-capture-size 128 --skip-mm-profiling \
+  --enable-auto-tool-choice --tool-call-parser muse_glimmer --reasoning-parser muse_glimmer \
+  --default-chat-template-kwargs '{"reasoning_strength": "low"}'
+
+# single-stream profile (bundled DFlash2 drafter, measured at the native 131k window)
+#   ... --max-model-len 131072 \
+#   --speculative-config '{"method":"dflash","model":"Capicua25x/Muse-Glimmer-30B-MXFP4-Quark-RDNA4/dflash-draft","num_speculative_tokens":3,"attention_backend":"TRITON_ATTN"}'
+```
+
+- Reasoning is a chat-template kwarg, `reasoning_strength` (`low`/`medium`/`high`/`xhigh`) — `reasoning_effort` is inert on vLLM.
+- The `rope_scaling` override must sit on the **text config** of this multimodal arch (a top-level override is silently ignored); the shipped config already does.
+- At the 1M window, `--gpu-memory-utilization 0.92` starves the drafter's KV; 0.90 is stable on 32 GB cards.
+
+Measured on 2× R9700 TP2 (bench v3): concurrency profile **28.4 tok/s c1 · 351 agg @c16 · 615 agg @c32** short, **328 agg @c16** on 6k prefill (~16-user ceiling at ≥20 tok/s per user); DFlash2 single-stream **57.0 tok/s c1** (accept 1.55/step) rising to **296 agg @c8** on 6k prefill (accept 2.08). Quality on the 1M config: IFEval 5-seed medians inst 0.906 / prompt 0.863 (native config 0.930 / 0.900 — the YaRN tax, stated on the card); τ²-bench telecom **0.842**, airline **0.840**. Long-context retrieval past 131k is community-verified (llama.cpp needles to 832k) — our own probe on this quant is owed and the card says so.
+
 ## Reproducibility — same config, different outputs, and why
 
 vLLM compiles the model with inductor autotuning: candidate kernels are **benchmarked at first startup** and
