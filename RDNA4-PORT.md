@@ -85,7 +85,7 @@ docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add v
 - The `rope_scaling` override must sit on the **text config** of this multimodal arch (a top-level override is silently ignored); the shipped config already does.
 - At the 1M window, `--gpu-memory-utilization 0.92` starves the drafter's KV; 0.90 is stable on 32 GB cards.
 
-Measured on 2× R9700 TP2 (bench v3): concurrency profile **28.4 tok/s c1 · 351 agg @c16 · 615 agg @c32** short, **328 agg @c16** on 6k prefill (~16-user ceiling at ≥20 tok/s per user); DFlash2 single-stream **57.0 tok/s c1** (accept 1.55/step) rising to **296 agg @c8** on 6k prefill (accept 2.08). Quality on the 1M config: IFEval 5-seed medians inst 0.906 / prompt 0.863 (native config 0.930 / 0.900 — the YaRN tax, stated on the card); τ²-bench telecom **0.842**, airline **0.840**. Long-context retrieval past 131k is community-verified (llama.cpp needles to 832k) — our own probe on this quant is owed and the card says so.
+Measured on 2× R9700 TP2 (bench v3): concurrency profile **28.4 tok/s c1 · 351 agg @c16 · 615 agg @c32** short, **328 agg @c16** on 6k prefill (~16-user ceiling at ≥20 tok/s per user); DFlash2 single-stream **57.0 tok/s c1** (accept 1.55/step) rising to **296 agg @c8** on 6k prefill (accept 2.08). Quality on the 1M config: IFEval 5-seed medians inst 0.906 / prompt 0.863 (native config 0.930 / 0.900 — the YaRN tax, stated on the card); τ²-bench telecom **0.842**, airline **0.840**. Long-context retrieval past 131k verified by us on this quant: every rung up to 832k tokens at depths 10/50/90 (single-needle probe; see the card for prefill times).
 
 ## Reproducibility — same config, different outputs, and why
 
