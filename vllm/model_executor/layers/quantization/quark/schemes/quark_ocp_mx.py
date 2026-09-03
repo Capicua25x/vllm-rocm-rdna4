@@ -212,6 +212,8 @@ class QuarkOCP_MX(QuarkScheme):
         if self.weight_quant_key == kMxfp4Static:
             self.ocp_mx_linear = init_mxfp4_linear_kernel(
                 activation_quant_key=self.activation_quant_key,
+                input_size=input_size_per_partition,
+                output_size=output_size_per_partition,
             )
         elif self.weight_quant_key in [kMxfp6E2M3Static, kMxfp6E3M2Static]:
             self.ocp_mx_linear = init_mxfp6_linear_kernel(

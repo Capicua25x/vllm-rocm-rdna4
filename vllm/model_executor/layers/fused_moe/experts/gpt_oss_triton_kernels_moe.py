@@ -1055,9 +1055,12 @@ class UnfusedOAITritonExperts(LoRAExpertsMixin, BaseOAITritonExperts):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
+        # GELU_TANH (Gemma-4 experts) takes the generic apply_moe_activation
+        # path below (gelu_tanh_and_mul), like GELU does.
         return activation in [
             MoEActivation.SILU,
             MoEActivation.GELU,
+            MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI,
             MoEActivation.SWIGLUSTEP,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,

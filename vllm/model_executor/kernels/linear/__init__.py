@@ -887,11 +887,15 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
 
 def init_mxfp4_linear_kernel(
     activation_quant_key: QuantKey | None = None,
+    input_size: int | None = None,
+    output_size: int | None = None,
 ) -> MxFp4LinearKernel:
     """Select and instantiate the best MXFP4 linear kernel for the
     current platform."""
     config = MxFp4LinearLayerConfig(
         activation_quant_key=activation_quant_key,
+        input_size=input_size,
+        output_size=output_size,
     )
 
     platform = current_platform._enum

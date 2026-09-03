@@ -293,6 +293,8 @@ class RdnaMxfp4Fp8LinearKernel(MxFp4LinearKernel):
     def can_implement(cls, config: MxFp4LinearLayerConfig) -> tuple[bool, str | None]:
         if config.activation_quant_key not in (None, kMxfp4Dynamic):
             return False, "supports unquantized or MXFP4-dynamic activation configs only"
+        if config.input_size is not None and config.input_size % 128 != 0:
+            return False, f"needs K to be a multiple of 128 (got {config.input_size})"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

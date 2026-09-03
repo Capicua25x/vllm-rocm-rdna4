@@ -22,6 +22,11 @@ class MxFp4LinearLayerConfig:
     """
 
     activation_quant_key: QuantKey | None = None
+    # Per-partition GEMM shape (K = input features, N = output features), when the
+    # caller knows it. Kernels with alignment requirements use it in can_implement()
+    # so an unaligned layer falls through to the next kernel instead of failing later.
+    input_size: int | None = None
+    output_size: int | None = None
 
 
 class MxFp4LinearKernel(ABC):
