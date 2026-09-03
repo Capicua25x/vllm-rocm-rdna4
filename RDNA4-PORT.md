@@ -54,6 +54,25 @@ quantizers/tuner). Complete `docker run` commands for both profiles are on the
 runner is equivalent to V1 in output-quality class and MTP throughput (±3% at every level, same ceiling) — the
 profile difference is the drafter, not the runner.
 
+## Concurrency across the collection (2× R9700 TP2, 6,000-token prompts, 400 output tokens)
+
+Same box, same bench harness family, per-user tok/s with the aggregate in parentheses. Speculative decoding is on where
+the model ships a drafter (MTP-3 for Qwen and Gemma; DFlash2 for Glimmer's single-stream profile only, not in this table).
+
+| model (quant, drafter) | c1 | c4 | c16 | short-prompt c1 | bench |
+|---|---|---|---|---|---|
+| Qwen3.8-27B-FP8 (prod, MTP-3) | 55.2 | – | 20.3 (315) · c8 30.2 (224) | – | v4, nonce topics, thinking ON |
+| Gemma-4-26B-A4B MXFP4 (MoE, MTP-3) | **85.3** | 61.4 (232) | **37.2 (488)** | 98.9 | v3, fixed prompt, temp 0 |
+| Gemma-4-31B MXFP4 (dense, fp8 KV, MTP-3) | 62.2 | 52.1 (206) | 29.6 (388) | 21.0 | v3, fixed prompt, temp 0 |
+| Muse-Glimmer-30B MXFP4 (dense VL, 1M profile, no drafter) | 27.9 | (102) | 20.5 (328) | 28.4 | v3 |
+
+How to read it: bench v3 uses one fixed prompt at temperature 0, so a drafter's acceptance on it is not typical traffic
+— the Gemma-31B row is the clearest case (the MTP head accepted every drafted token on the 6k prompt and none on the short
+one, so 21 tok/s is that model's plain-decoding floor and 62 its ceiling; under real agentic load it measured ~39 per
+request at 4 concurrent with 65 % acceptance). Bench v4 (the Qwen row) rotates topics with a nonce and is the harder,
+more honest number; the cross-model comparison is therefore indicative, not a ranking. The MoE's advantage is real: 4B
+active parameters per token on a bandwidth-bound decode path.
+
 ## Serving Ornith-1.5-35B-A3B — MXFP4 MoE on gfx12
 
 Get the quant: **[Capicua25x/Ornith-1.5-35B-A3B-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/Ornith-1.5-35B-A3B-MXFP4-Quark-RDNA4)** — data-free Quark MXFP4 of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) (MIT), 67 GB bf16 → **21.4 GB**, with a **bundled 737 MB DFlash drafter** for single-stream serving. The model card carries the full 5-seed quality table (tracks the official FP8 within seed noise; τ²-telecom **0.965**, 110/114), the same-protocol throughput grid, and complete `docker run` commands for both profiles — the [Docker Hub page](https://hub.docker.com/r/capicua25x/vllm-rocm-rdna4) mirrors them.
