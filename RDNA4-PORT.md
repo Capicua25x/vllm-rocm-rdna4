@@ -92,7 +92,7 @@ Measured on 2× R9700 TP2 (bench v3): concurrency profile **28.4 tok/s c1 · 351
 
 ## Serving Gemma-4-26B-A4B-it — MXFP4 MoE on gfx12, 262k window, native MTP-3 drafter (rc13)
 
-Get the quant: **[Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4)** — Quark MXFP4 of [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) (Gemma Terms of Use): all 128×30 experts and the dense MLPs in MXFP4, attention/routers/vision/`lm_head` in bf16, the serving config baked in (see the card). The MTP drafter is Google's own bf16 assistant head, pulled from the Hub.
+Get the quant: **[Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4)** — Quark MXFP4 of [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) (**Gemma Terms of Use — permissive but proprietary and revocable, not open source; the Apache-2.0 models on this image are Ornith-1.5 and Muse-Glimmer**): all 128×30 experts and the dense MLPs in MXFP4, attention/routers/vision/`lm_head` in bf16, the serving config baked in (see the card). The MTP drafter is Google's own bf16 assistant head, pulled from the Hub.
 
 ```bash
 docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --ipc=host \
@@ -110,7 +110,7 @@ docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add v
 - Thinking is a chat-template kwarg: `"chat_template_kwargs": {"enable_thinking": true}`; the `gemma4` reasoning parser splits `reasoning_content`. `reasoning_effort` is inert.
 - Boot: 11.98 GiB per card, KV cache 727,358 tokens (2.77× concurrency at 262k), ~5 min to ready on a warm cache.
 
-Measured on 2× R9700 TP2 with MTP-3 (bench v3): **6k-token prompts 85.3 tok/s c1 · 61.4/user (232 agg) @c4 · 37.2/user (488 agg) @c16**, accepted 2.3–2.8 per step; short prompts 98.9 tok/s c1. Quality on this artifact: IFEval-80 inst-strict 0.9297 / prompt-strict 0.8875; needle 100k and 200k all pass at 3 depths (cold prefill 3–4 min @105k, 11–14 min @210k — the known cost of Gemma-4's head-512 global layers); WhatsApp order-agent eval 36/37 at 13.2 s per turn chain; SQL-analyst regression suite 155/156; τ²-bench telecom (114, c6, thinking): filled in at release.
+Measured on 2× R9700 TP2 with MTP-3 (bench v3): **6k-token prompts 85.3 tok/s c1 · 61.4/user (232 agg) @c4 · 37.2/user (488 agg) @c16**, accepted 2.3–2.8 per step; short prompts 98.9 tok/s c1. Quality on this artifact: IFEval-80 inst-strict 0.9297 / prompt-strict 0.8875; needle 100k and 200k all pass at 3 depths (cold prefill 3–4 min @105k, 11–14 min @210k — the known cost of Gemma-4's head-512 global layers); WhatsApp order-agent eval 36/37 at 13.2 s per turn chain; SQL-analyst regression suite 155/156; τ²-bench telecom (114, c6, thinking): **0.4649** (53/114) — weak at multi-turn policy work (q38-FP8 on this image: 0.9386; Glimmer: 0.8421).
 
 ## Reproducibility — same config, different outputs, and why
 
