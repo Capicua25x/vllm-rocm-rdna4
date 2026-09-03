@@ -26,6 +26,9 @@ Attribution and lineage are unchanged from that document.
 - **3D split-KV attention gate extended to speculative verify shapes**: the 2D/3D selector keys on
   `q.shape[0]` with `MAX_QLEN_3D = 8`, so an MTP/DFlash verify of small q_len over long KV takes the 3D grid
   instead of falling to a ~10-workgroup 2D launch.
+- **rc13 (2026-09-03)**: Quark MXFP4 **MoE** models serve on gfx12 — `gelu_tanh` allowed on the unfused Triton MoE experts, and
+  the RDNA4 fp8 MXFP4 linear kernel declines K not divisible by 128 (falls through to the weight-only kernel). First user:
+  Gemma-4-26B-A4B-it (section below).
 - `NCCL_PROTO=Simple` recommended for TP2 over PCIe on these cards (RCCL's LL protocol measured ~2.8× slower
   for the ≈640 KB decode all-reduces).
 
@@ -86,6 +89,28 @@ docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add v
 - At the 1M window, `--gpu-memory-utilization 0.92` starves the drafter's KV; 0.90 is stable on 32 GB cards.
 
 Measured on 2× R9700 TP2 (bench v3): concurrency profile **28.4 tok/s c1 · 351 agg @c16 · 615 agg @c32** short, **328 agg @c16** on 6k prefill (~16-user ceiling at ≥20 tok/s per user); DFlash2 single-stream **57.0 tok/s c1** (accept 1.55/step) rising to **296 agg @c8** on 6k prefill (accept 2.08). Quality on the 1M config: IFEval 5-seed medians inst 0.906 / prompt 0.863 (native config 0.930 / 0.900 — the YaRN tax, stated on the card); τ²-bench telecom **0.842**, airline **0.840**. Long-context retrieval past 131k verified by us on this quant: every rung up to 832k tokens at depths 10/50/90 (single-needle probe; see the card for prefill times).
+
+## Serving Gemma-4-26B-A4B-it — MXFP4 MoE on gfx12, 262k window, native MTP-3 drafter (rc13)
+
+Get the quant: **[Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4)** — Quark MXFP4 of [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) (Gemma Terms of Use): all 128×30 experts and the dense MLPs in MXFP4, attention/routers/vision/`lm_head` in bf16, the serving config baked in (see the card). The MTP drafter is Google's own bf16 assistant head, pulled from the Hub.
+
+```bash
+docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface capicua25x/vllm-rocm-rdna4:0.28.0-rdna4-rc13 \
+  serve Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4 --port 8011 --trust-remote-code --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.90 --max-model-len 262144 --attention-backend TRITON_ATTN --moe-backend triton_unfused \
+  --enable-prefix-caching --max-num-seqs 32 --max-num-batched-tokens 8000 --max-cudagraph-capture-size 128 --skip-mm-profiling \
+  --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 \
+  --speculative-config '{"model":"google/gemma-4-26B-A4B-it-assistant","num_speculative_tokens":3}'
+```
+
+- **Needs rc13** (Python-only layer over rc12, port commit `f5995c9c7`): `gelu_tanh` on the unfused Triton MoE experts, and the RDNA4 fp8 MXFP4 kernel declining GEMMs whose K is not a multiple of 128 (this model's dense `down_proj`, K = 1056 per rank) so they fall through to the weight-only RDNA kernel.
+- The experts run **weight-only (bf16 activations)** — vLLM has no MoE kernel for MXFP4 activations on this hardware and emulation would dequantize every forward; the shipped config declares it (`layer_quant_config["*experts*"].input_tensors = null`). The dense MLPs use the MXFP4×fp8 WMMA kernel as usual.
+- Two more config facts the raw Quark export lacks: `v_proj` excludes for the five `attention_k_eq_v` global layers (no `v_proj` on disk; vLLM's fused `qkv_proj` needs one scheme for all shards) and the flat `global_head_dim: 512` / `num_global_key_value_heads: 2` (transformers ≥ 5.15 writes `per_layer_config`, which vLLM 0.28 does not read).
+- Thinking is a chat-template kwarg: `"chat_template_kwargs": {"enable_thinking": true}`; the `gemma4` reasoning parser splits `reasoning_content`. `reasoning_effort` is inert.
+- Boot: 11.98 GiB per card, KV cache 727,358 tokens (2.77× concurrency at 262k), ~5 min to ready on a warm cache.
+
+Measured on 2× R9700 TP2 with MTP-3 (bench v3): **6k-token prompts 85.3 tok/s c1 · 61.4/user (232 agg) @c4 · 37.2/user (488 agg) @c16**, accepted 2.3–2.8 per step; short prompts 98.9 tok/s c1. Quality on this artifact: IFEval-80 inst-strict 0.9297 / prompt-strict 0.8875; needle 100k and 200k all pass at 3 depths (cold prefill 3–4 min @105k, 11–14 min @210k — the known cost of Gemma-4's head-512 global layers); WhatsApp order-agent eval 36/37 at 13.2 s per turn chain; SQL-analyst regression suite 155/156; τ²-bench telecom (114, c6, thinking): filled in at release.
 
 ## Reproducibility — same config, different outputs, and why
 
