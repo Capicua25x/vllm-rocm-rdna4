@@ -6,6 +6,7 @@
 > Also served on this image: **[Ornith-1.5-35B-A3B MXFP4](https://huggingface.co/Capicua25x/Ornith-1.5-35B-A3B-MXFP4-Quark-RDNA4)** (256-expert MoE on gfx12, bundled DFlash drafter) — serving notes in [RDNA4-PORT.md](RDNA4-PORT.md).
 > Also: **[Muse-Glimmer-30B MXFP4](https://huggingface.co/Capicua25x/Muse-Glimmer-30B-MXFP4-Quark-RDNA4)** (dense 30B VL, Apache-2.0, 1M-context profile + native config, bundled DFlash2 drafter) — serving section in `RDNA4-PORT.md`.
 > Also: **[Gemma-4-26B-A4B-it MXFP4](https://huggingface.co/Capicua25x/gemma-4-26B-A4B-it-MXFP4-Quark-RDNA4)** (26B MoE, 4B active, 262k window, Google's MTP-3 head; needs image tag `0.28.0-rdna4-rc13`) — serving notes in [RDNA4-PORT.md](RDNA4-PORT.md#serving-gemma-4-26b-a4b-it--mxfp4-moe-on-gfx12-262k-window-native-mtp-3-drafter-rc13).
+> Also: **[Gemma-4-31B-it MXFP4](https://huggingface.co/Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4)** (dense 31B, 262k window with fp8 KV, Google's MTP-3 head; τ² telecom 0.75; pre-release) — serving notes in [RDNA4-PORT.md](RDNA4-PORT.md#serving-gemma-4-31b-it--mxfp4-dense-on-gfx12-262k-window-with-fp8-kv-native-mtp-3-drafter-rc13).
 > Docker image: `capicua25x/vllm-rocm-rdna4:0.28.0-rdna4` (= `:latest`). Upstream README follows below.
 
 <!-- markdownlint-disable MD001 MD041 -->

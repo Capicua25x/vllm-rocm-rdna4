@@ -112,6 +112,26 @@ docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add v
 
 Measured on 2× R9700 TP2 with MTP-3 (bench v3): **6k-token prompts 85.3 tok/s c1 · 61.4/user (232 agg) @c4 · 37.2/user (488 agg) @c16**, accepted 2.3–2.8 per step; short prompts 98.9 tok/s c1. Quality on this artifact: IFEval-80 inst-strict 0.9297 / prompt-strict 0.8875; needle 100k and 200k all pass at 3 depths (cold prefill 3–4 min @105k, 11–14 min @210k — the known cost of Gemma-4's head-512 global layers); WhatsApp order-agent eval 36/37 at 13.2 s per turn chain; SQL-analyst regression suite 155/156; τ²-bench telecom (114, c6, thinking): **0.4649** (53/114) — weak at multi-turn policy work (q38-FP8 on this image: 0.9386; Glimmer: 0.8421).
 
+## Serving Gemma-4-31B-it — MXFP4 dense on gfx12, 262k window with fp8 KV, native MTP-3 drafter (rc13)
+
+Get the quant: **[Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4)** (pre-release; the repo opens at launch) — Quark MXFP4 of [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) (**Gemma Terms of Use — permissive but proprietary and revocable, not open source**): all 60 MLP blocks in MXFP4, attention/vision/`lm_head` in bf16, the serving config baked in. The MTP drafter is Google's bf16 assistant head, pulled from the Hub.
+
+```bash
+docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface capicua25x/vllm-rocm-rdna4:0.28.0-rdna4-rc13 \
+  serve Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4 --port 8011 --trust-remote-code --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.95 --max-model-len 262144 --kv-cache-dtype fp8 --attention-backend TRITON_ATTN \
+  --enable-prefix-caching --max-num-seqs 32 --max-num-batched-tokens 8000 --max-cudagraph-capture-size 128 --skip-mm-profiling \
+  --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 \
+  --speculative-config '{"model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":3}'
+```
+
+- **fp8 KV is what makes the window fit on 32 GB cards.** With bf16 KV one 262k request needs 16.5 GiB of KV per card (11.5 GiB at 131k — the sliding-window layers add a fixed base) against ~8.7 GiB free next to 16.4 GiB of weights and the draft; `--kv-cache-dtype fp8` halves it and the command above boots with a 287,588-token KV pool (1.1× a full 262k request). KV scales are vLLM's defaults (uncalibrated); the quality rows were measured that way.
+- The shipped config adds `v_proj` excludes for the ten `attention_k_eq_v` global layers (no `v_proj` on disk; vLLM's fused `qkv_proj` needs one scheme for all shards); this export already carries the flat `global_head_dim` / `num_global_key_value_heads` keys. Needs rc13 like the 26B (the dense MLP K is aligned here, but rc13 is the tag the gate ran on).
+- Thinking: `"chat_template_kwargs": {"enable_thinking": true}`; parsers `gemma4`; `reasoning_effort` is inert.
+
+Measured on 2× R9700 TP2 with MTP-3: **τ²-bench telecom 0.7544** (114 tasks, c6, thinking; the 26B-A4B scores 0.4649, Muse-Glimmer 0.8421, Qwen3.8-27B-FP8 0.9386); SQL-analyst regression suite 156/156; WhatsApp order-agent eval 35/37 at 22.5 s per turn chain; live sample under the τ² load 156 tok/s aggregate at 4 requests (~39 per request, draft acceptance 65 %). Needle 100k/200k, IFEval-80 and the concurrency rows: filled in at launch.
+
 ## Reproducibility — same config, different outputs, and why
 
 vLLM compiles the model with inductor autotuning: candidate kernels are **benchmarked at first startup** and
