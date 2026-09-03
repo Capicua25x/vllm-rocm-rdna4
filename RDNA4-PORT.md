@@ -114,7 +114,7 @@ Measured on 2× R9700 TP2 with MTP-3 (bench v3): **6k-token prompts 85.3 tok/s c
 
 ## Serving Gemma-4-31B-it — MXFP4 dense on gfx12, 262k window with fp8 KV, native MTP-3 drafter (rc13)
 
-Get the quant: **[Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4)** (pre-release; the repo opens at launch) — Quark MXFP4 of [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) (**Gemma Terms of Use — permissive but proprietary and revocable, not open source**): all 60 MLP blocks in MXFP4, attention/vision/`lm_head` in bf16, the serving config baked in. The MTP drafter is Google's bf16 assistant head, pulled from the Hub.
+Get the quant: **[Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4](https://huggingface.co/Capicua25x/gemma-4-31B-it-MXFP4-Quark-RDNA4)** — Quark MXFP4 of [google/gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) (**Gemma Terms of Use — permissive but proprietary and revocable, not open source**): all 60 MLP blocks in MXFP4, attention/vision/`lm_head` in bf16, the serving config baked in. The MTP drafter is Google's bf16 assistant head, pulled from the Hub.
 
 ```bash
 docker run --rm --network=host --device=/dev/kfd --device=/dev/dri --group-add video --group-add render --ipc=host \
